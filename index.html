@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -1398,8 +1398,8 @@ async function handlePeerData(conn,data){
     queueRemoteIceCandidate(candidate);
     return;
   }
-  if(data.type==='sync'&&data.payload){
-    processSyncMessage(data.payload);
+  if(data.type){
+    processSyncMessage(data);
   }
 }
 function ensureViewerDataConn(){
@@ -1508,7 +1508,6 @@ function initRoom(){
   if(!canUsePeerTransport())setConnBadge('offline','Relay unavailable');
   setupRoleButtons();
   initPeerTransport();
-  ensureViewerDataConn();
   refreshShareAvailability();
   if(S.notes)document.getElementById('notes-area').value=S.notes;
   window.addEventListener('storage',onStore);
@@ -1530,18 +1529,26 @@ function initRoom(){
 
 /* -- SYNC -- */
 function broadcast(d){
-  const k='sd_m_'+S.roomCode;
   const p={...d,from:S.myName,ts:Date.now(),id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)};
-  const payload={type:'sync',payload:p};
+
+  // localStorage fallback for same-device
+  const k='sd_m_'+S.roomCode;
   localStorage.setItem(k,JSON.stringify(p));
-  setTimeout(()=>{try{if(localStorage.getItem(k)===JSON.stringify(p))localStorage.removeItem(k)}catch(e){}},5000);
+  setTimeout(()=>{
+    try{
+      if(localStorage.getItem(k)===JSON.stringify(p))
+        localStorage.removeItem(k)
+    }catch(e){}
+  },5000);
+
+  // Send directly via data channels
   let hasConn=false;
   for(const conn of NET.dataConns.values()){
     if(!conn)continue;
     hasConn=true;
-    safeSend(conn,payload);
+    safeSend(conn,p);
   }
-  if(!hasConn)MSG_QUEUE.push(payload);
+  if(!hasConn)MSG_QUEUE.push(p);
 }
 function onStore(e){
   if(!e.key||!e.key.startsWith('sd_m_'+S.roomCode)||!e.newValue)return;
@@ -1863,7 +1870,6 @@ async function viewerJoin(autoRetry=false){
     setSSStatus(autoRetry?'Reconnecting to stream...':'Connecting to host screen...','var(--violet)');
     document.getElementById('np').style.display='flex';
     document.getElementById('np-text').textContent='👁 Watching '+(S.partnerName||'host')+'\'s screen';
-    await startWebRTC('viewer');
     if(!NET.watchRequestConn||!NET.watchRequestConn.open){
       ensureViewerDataConn();
     }
@@ -1873,14 +1879,17 @@ async function viewerJoin(autoRetry=false){
     };
     if(NET.watchRequestConn&&NET.watchRequestConn.open){sendReq()}
     else if(NET.watchRequestConn){NET.watchRequestConn.on('open',sendReq)}
-    NET.watchRequestConn.on('error',()=>{
-      if(autoRetry){scheduleStreamReconnect();return}
-      toast('Could not reach host yet. Try Watch again.');
-      document.getElementById('ss-btn').style.display='flex';
-      document.getElementById('remote-screen').style.display='none';
-      document.getElementById('vph').style.display='flex';
-      setupRoleButtons();
-    });
+    if(NET.watchRequestConn&&!NET.watchRequestConn._errorHandlerAttached){
+      NET.watchRequestConn._errorHandlerAttached=true;
+      NET.watchRequestConn.on('error',()=>{
+        if(autoRetry){scheduleStreamReconnect();return}
+        toast('Could not reach host yet. Try Watch again.');
+        document.getElementById('ss-btn').style.display='flex';
+        document.getElementById('remote-screen').style.display='none';
+        document.getElementById('vph').style.display='flex';
+        setupRoleButtons();
+      });
+    }
     clearTimeout(NET.connectTimer);
     NET.connectTimer=setTimeout(()=>{
       if(autoRetry){scheduleStreamReconnect();return}
