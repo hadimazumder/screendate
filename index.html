@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -205,7 +205,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
   border-radius:99px;background:rgba(255,255,255,.04);border:1px solid var(--border);
   font-size:.78rem;color:var(--text3);
 }
-.rh-net{
+.rh-net,.rh-quality{
   display:flex;align-items:center;gap:.4rem;padding:.3rem .72rem;
   border-radius:99px;background:rgba(255,255,255,.04);border:1px solid var(--border);
   font-size:.72rem;color:var(--text3);
@@ -214,6 +214,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .rh-net.online .rh-net-dot{background:var(--green);box-shadow:0 0 7px var(--green)}
 .rh-net.warn .rh-net-dot{background:var(--gold);box-shadow:0 0 7px var(--gold)}
 .rh-net.offline .rh-net-dot{background:#ef4444;box-shadow:0 0 7px #ef4444}
+.rh-quality{display:none}
+.rh-quality.excellent{color:#34d399}
+.rh-quality.good{color:#a78bfa}
+.rh-quality.fair{color:#fbbf24}
+.rh-quality.poor{color:#ef4444}
 .rh-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:dotPulse 2s infinite}
 .rh-leave{
   display:flex;align-items:center;gap:.38rem;padding:.38rem .82rem;
@@ -228,6 +233,15 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
   display:none;align-items:center;gap:.65rem;
   padding:.4rem 1rem;background:rgba(240,96,127,.05);
   border-bottom:1px solid rgba(240,96,127,.1);font-size:.77rem;color:var(--text3);flex-shrink:0;
+}
+.reconnect-banner{
+  display:none;
+  background:rgba(251,191,36,0.08);
+  border-bottom:1px solid rgba(251,191,36,0.18);
+  color:#fbbf24;
+  font-size:.78rem;
+  text-align:center;
+  padding:.35rem;
 }
 .np-pulse{width:5px;height:5px;border-radius:50%;background:var(--pink);animation:dotPulse 1.4s ease infinite}
 .np-text{color:var(--gold);font-weight:500}
@@ -559,7 +573,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 @media(max-width:540px){
   .rh-partner{display:none}
-  .rh-net{display:none}
+  .rh-net,.rh-quality{display:none}
   .np{padding:.35rem .6rem;font-size:.72rem}
 
   .vp{min-height:44dvh}
@@ -713,8 +727,13 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
       <span class="rh-net-dot"></span>
       <span id="conn-badge-text">Relay offline</span>
     </div>
+    <div class="rh-quality" id="conn-quality">
+      <span id="conn-quality-text">&#128246; Good</span>
+    </div>
     <button class="rh-leave" onclick="leaveConfirm()">🚪 Leave</button>
   </div>
+
+  <div class="reconnect-banner" id="reconnect-banner">&#9889; Reconnecting &mdash; please wait...</div>
 
   <!-- Now playing -->
   <div class="np" id="np">
@@ -754,7 +773,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
       <!-- Remote viewer canvas (peer receives stream via WebRTC) -->
       <div id="remote-screen" style="display:none;flex:1;align-items:center;justify-content:center;flex-direction:column;gap:1rem;background:#000">
         <div style="font-size:3rem">👀</div>
-        <div style="color:var(--text2);font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:300">Connecting to screen share…</div>
+        <div id="remote-screen-text" style="color:var(--text2);font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:300">Connecting to screen share…</div>
         <div class="ss-dots"><span></span><span></span><span></span></div>
       </div>
 
@@ -854,6 +873,15 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 let S={myName:'',partnerName:'',roomName:'',roomCode:'',isHost:false,messages:[],notes:'',snacks:[],myMood:'',partnerMood:'',videoUrl:''};
 const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
 let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0};
+const CONN={
+  quality:'unknown',
+  dataConnected:false,
+  streamConnected:false,
+  streamRetries:0,
+  qualityInterval:null,
+  reconnectBanner:null
+};
+let msgQueue=[];
 const SEEN_SYNC=new Set();
 const QS=new URLSearchParams(location.search);
 const PEER_CFG={
@@ -873,9 +901,127 @@ function setConnBadge(state,text){
   else el.classList.add('offline');
   tx.textContent=text;
 }
+function setReconnectBanner(show){
+  if(!CONN.reconnectBanner)CONN.reconnectBanner=document.getElementById('reconnect-banner');
+  if(!CONN.reconnectBanner)return;
+  CONN.reconnectBanner.style.display=show?'block':'none';
+}
+function hasOpenDataConn(){
+  for(const conn of NET.dataConns.values()){
+    if(conn&&conn.open)return true;
+  }
+  return false;
+}
+function setQualityBadge(quality){
+  const badge=document.getElementById('conn-quality');
+  const text=document.getElementById('conn-quality-text');
+  if(!badge||!text)return;
+  if(!quality||quality==='unknown'){
+    badge.style.display='none';
+    badge.classList.remove('excellent','good','fair','poor');
+    CONN.quality='unknown';
+    return;
+  }
+  badge.style.display='flex';
+  badge.classList.remove('excellent','good','fair','poor');
+  badge.classList.add(quality);
+  if(quality==='excellent')text.textContent='\uD83D\uDCF6 Excellent';
+  else if(quality==='good')text.textContent='\uD83D\uDCF6 Good';
+  else if(quality==='fair')text.textContent='\uD83D\uDCF6 Fair';
+  else text.textContent='\uD83D\uDCF6 Poor';
+  CONN.quality=quality;
+}
+function stopConnectionQualityMonitor(){
+  if(CONN.qualityInterval){
+    clearInterval(CONN.qualityInterval);
+    CONN.qualityInterval=null;
+  }
+  setQualityBadge('unknown');
+}
+function getActiveStatsPeerConnection(){
+  if(SS&&SS.pc&&typeof SS.pc.getStats==='function')return SS.pc;
+  if(!NET.currentCall)return null;
+  const callPc=NET.currentCall.peerConnection||NET.currentCall._pc||NET.currentCall.pc||null;
+  if(callPc&&typeof callPc.getStats==='function')return callPc;
+  return null;
+}
+async function sampleConnectionQuality(){
+  const pc=getActiveStatsPeerConnection();
+  if(!pc){setQualityBadge('unknown');return}
+  try{
+    const stats=await pc.getStats();
+    let rttMs=Number.POSITIVE_INFINITY;
+    let lost=0;
+    let total=0;
+    stats.forEach(report=>{
+      if(report.type==='candidate-pair'){
+        const selected=report.nominated||report.selected||report.state==='succeeded';
+        if(!selected)return;
+        if(typeof report.currentRoundTripTime==='number'){
+          rttMs=Math.min(rttMs,report.currentRoundTripTime*1000);
+          return;
+        }
+        if(typeof report.totalRoundTripTime==='number'&&typeof report.responsesReceived==='number'&&report.responsesReceived>0){
+          rttMs=Math.min(rttMs,(report.totalRoundTripTime/report.responsesReceived)*1000);
+        }
+        return;
+      }
+      if(report.type==='remote-inbound-rtp'&&typeof report.roundTripTime==='number'){
+        rttMs=Math.min(rttMs,report.roundTripTime*1000);
+      }
+      if((report.type==='inbound-rtp'||report.type==='remote-inbound-rtp')&&!report.isRemote){
+        const recv=Math.max(0,Number(report.packetsReceived)||0);
+        const pl=Math.max(0,Number(report.packetsLost)||0);
+        if(recv+pl>0){
+          total+=recv+pl;
+          lost+=pl;
+        }
+      }
+    });
+    if(!Number.isFinite(rttMs))rttMs=999;
+    const lossPct=total>0?(lost/total)*100:0;
+    let quality='poor';
+    if(rttMs<80&&lossPct<1)quality='excellent';
+    else if(rttMs<150&&lossPct<3)quality='good';
+    else if(rttMs<300&&lossPct<8)quality='fair';
+    setQualityBadge(quality);
+  }catch(e){
+    setQualityBadge('unknown');
+  }
+}
+function monitorConnectionQuality(){
+  if(CONN.qualityInterval)return;
+  sampleConnectionQuality();
+  CONN.qualityInterval=setInterval(sampleConnectionQuality,3000);
+}
+function scheduleStreamReconnect(){
+  if(SS.role!=='viewer')return;
+  if(!hasOpenDataConn())return;
+  CONN.streamConnected=false;
+  stopConnectionQualityMonitor();
+  if(CONN.streamRetries>=3){
+    toast('Could not reconnect. Ask host to restart sharing.');
+    return;
+  }
+  CONN.streamRetries+=1;
+  toast('Stream dropped. Reconnecting...');
+  const remote=document.getElementById('remote-screen');
+  const remoteText=document.getElementById('remote-screen-text');
+  if(remote)remote.style.display='flex';
+  if(remoteText)remoteText.textContent='Reconnecting to stream...';
+  setSSStatus('Reconnecting to stream...','var(--gold)');
+  setTimeout(()=>{
+    if(SS.role!=='viewer')return;
+    if(!hasOpenDataConn())return;
+    if(CONN.streamRetries>3)return;
+    viewerJoin(true).catch(()=>{});
+  },3000);
+}
 function schedulePeerReconnect(reason){
   if(!canUsePeerTransport())return;
   if(NET.reconnectTimer)return;
+  setReconnectBanner(true);
+  CONN.dataConnected=false;
   NET.retries=(NET.retries||0)+1;
   const delay=Math.min(12000,900*Math.pow(1.6,NET.retries));
   setConnBadge('warn','Relay reconnecting…');
@@ -1041,11 +1187,16 @@ function initPeerTransport(){
     return;
   }
   NET.peer.on('open',()=>{
+    const wasReconnecting=(NET.retries||0)>0||!!NET.reconnectTimer;
     NET.ready=true;
+    CONN.dataConnected=hasOpenDataConn();
     NET.retries=0;
     if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
+    setReconnectBanner(false);
     setConnBadge('online','Relay connected');
+    if(wasReconnecting)toast('Back online ✅');
     if(!S.isHost){setupRoleButtons();ensureViewerDataConn()}
+    if(S.isHost)broadcast({type:'join',name:S.myName});
   });
   NET.peer.on('error',err=>{
     NET.lastError=(err&&err.type)||err.message||'peer error';
@@ -1059,11 +1210,13 @@ function initPeerTransport(){
   });
   NET.peer.on('disconnected',()=>{
     NET.ready=false;
+    CONN.dataConnected=false;
     setConnBadge('warn','Relay disconnected');
     schedulePeerReconnect('disconnected');
   });
   NET.peer.on('close',()=>{
     NET.ready=false;
+    CONN.dataConnected=false;
     setConnBadge('offline','Relay closed');
   });
   NET.peer.on('connection',conn=>registerPeerConn(conn));
@@ -1072,7 +1225,11 @@ function initPeerTransport(){
       if(!SS.stream){call.close();return}
       try{call.answer(SS.stream)}catch(e){call.close();return}
       NET.currentCall=call;
-      call.on('close',()=>{if(NET.currentCall===call)NET.currentCall=null});
+      call.on('close',()=>{
+        if(NET.currentCall===call)NET.currentCall=null;
+        CONN.streamConnected=false;
+        stopConnectionQualityMonitor();
+      });
       return;
     }
     try{call.answer()}catch(e){call.close();return}
@@ -1081,6 +1238,9 @@ function initPeerTransport(){
       clearTimeout(NET.connectTimer);
       NET.connectTimer=null;
       bindScreenVideo(stream,false);
+      CONN.streamConnected=true;
+      CONN.streamRetries=0;
+      monitorConnectionQuality();
       document.getElementById('remote-screen').style.display='none';
       setSSStatus('👁 Watching '+(S.partnerName||'host')+'\'s screen','var(--violet)');
       sysMsg('Screen share connected 🎉');
@@ -1088,6 +1248,9 @@ function initPeerTransport(){
     });
     call.on('close',()=>{
       if(NET.currentCall===call)NET.currentCall=null;
+      CONN.streamConnected=false;
+      stopConnectionQualityMonitor();
+      if(SS.role==='viewer'&&hasOpenDataConn())scheduleStreamReconnect();
     });
   });
 }
@@ -1095,10 +1258,39 @@ function registerPeerConn(conn){
   if(!conn)return;
   NET.dataConns.set(conn.peer,conn);
   if(!S.isHost)NET.watchRequestConn=conn;
+  conn.on('open',()=>{
+    const wasReconnect=!!CONN._dataReconnectPending;
+    CONN.dataConnected=true;
+    if(msgQueue.length){
+      const pending=[...msgQueue];
+      msgQueue=[];
+      pending.forEach(m=>{
+        try{conn.send(m)}catch(e){msgQueue.push(m)}
+      });
+    }
+    if(wasReconnect){
+      CONN._dataReconnectPending=false;
+      setConnBadge('online','Relay connected');
+      toast('Reconnected ✅');
+      broadcast({type:'join',name:S.myName});
+    }
+    broadcast({type:'join',name:S.myName});
+  });
   conn.on('data',data=>handlePeerData(conn,data));
   conn.on('close',()=>{
     if(NET.dataConns.get(conn.peer)===conn)NET.dataConns.delete(conn.peer);
     if(NET.watchRequestConn===conn)NET.watchRequestConn=null;
+    CONN.dataConnected=hasOpenDataConn();
+    if(!CONN.dataConnected&&!S.isHost){
+      CONN._dataReconnectPending=true;
+      setTimeout(()=>{
+        if(!CONN.dataConnected&&SS.role==='viewer'){
+          setConnBadge('warn','Reconnecting...');
+          toast('Connection lost. Reconnecting...');
+          ensureViewerDataConn();
+        }
+      },2000);
+    }
   });
 }
 async function handlePeerData(conn,data){
@@ -1158,7 +1350,7 @@ function ensureViewerDataConn(){
   if(S.isHost||!NET.peer||!NET.ready)return;
   const hostId=hostPeerId();
   const existing=NET.dataConns.get(hostId);
-  if(existing&&existing.open){NET.watchRequestConn=existing;return}
+  if(existing&&existing.open){NET.watchRequestConn=existing;CONN.dataConnected=true;return}
   const conn=NET.peer.connect(hostId,{reliable:true});
   NET.watchRequestConn=conn;
   registerPeerConn(conn);
@@ -1176,6 +1368,12 @@ function startPeerStreamToViewer(viewerId){
 
 /* -- ROOM -- */
 function initRoom(){
+  CONN.reconnectBanner=document.getElementById('reconnect-banner');
+  setReconnectBanner(false);
+  stopConnectionQualityMonitor();
+  CONN.dataConnected=hasOpenDataConn();
+  CONN.streamConnected=false;
+  CONN.streamRetries=0;
   document.getElementById('rh-name').textContent='💞 '+S.roomName;
   document.getElementById('partner-badge').textContent=S.partnerName||'Waiting for partner…';
   initEmojiGrid();initMoodRow();renderSnacks();
@@ -1186,8 +1384,14 @@ function initRoom(){
   refreshShareAvailability();
   if(S.notes)document.getElementById('notes-area').value=S.notes;
   window.addEventListener('storage',onStore);
-  broadcast({type:'join',name:S.myName});
+  setTimeout(()=>{
+    const badge=document.getElementById('partner-badge');
+    if(badge&&/^Waiting/i.test((badge.textContent||'').trim())){
+      broadcast({type:'join',name:S.myName});
+    }
+  },3000);
   sysMsg('Welcome to '+S.roomName+' 💖');
+  if(!S.isHost)sysMsg('Waiting for host...');
   if(S.isHost)sysMsg('Share code '+S.roomCode+' with your partner');
 }
 
@@ -1197,11 +1401,17 @@ function broadcast(d){
   const p={...d,from:S.myName,ts:Date.now(),id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)};
   localStorage.setItem(k,JSON.stringify(p));
   setTimeout(()=>{try{if(localStorage.getItem(k)===JSON.stringify(p))localStorage.removeItem(k)}catch(e){}},5000);
+  let hasConn=false;
   for(const conn of NET.dataConns.values()){
+    if(!conn)continue;
+    hasConn=true;
     if(conn&&conn.open){
-      try{conn.send({type:'sync',payload:p})}catch(e){}
+      try{conn.send({type:'sync',payload:p})}catch(e){msgQueue.push({type:'sync',payload:p})}
+    }else{
+      msgQueue.push({type:'sync',payload:p});
     }
   }
+  if(!hasConn)msgQueue.push({type:'sync',payload:p});
 }
 function onStore(e){
   if(!e.key||!e.key.startsWith('sd_m_'+S.roomCode)||!e.newValue)return;
@@ -1221,7 +1431,21 @@ function processSyncMessage(d){
   if(d.type==='join'){
     S.partnerName=d.name;document.getElementById('partner-badge').textContent=d.name;
     sysMsg(d.name+' joined 💫');
+    if(S.isHost){
+      broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing});
+    }
     if(S.videoUrl)broadcast({type:'video',url:S.videoUrl});
+  }else if(d.type==='welcome'){
+    if(d.hostName){
+      S.partnerName=d.hostName;
+      document.getElementById('partner-badge').textContent=d.hostName;
+    }
+    if(d.roomName){
+      S.roomName=d.roomName;
+      document.getElementById('rh-name').textContent='💞 '+S.roomName;
+    }
+    sysMsg('Connected to '+(S.partnerName||'host')+' ✅');
+    if(d.isSharing)incomingSsStart(S.partnerName||'Host');
   }else if(d.type==='chat'){addMsg(d.name,d.text,false)}
   else if(d.type==='reaction'){floatEmoji(d.emoji);sysMsg(d.name+' reacted '+d.emoji)}
   else if(d.type==='ss_start'){incomingSsStart(d.name)}
@@ -1331,6 +1555,7 @@ function refreshShareAvailability(){
 
 async function toggleShare(){
   if(SS.isSharing){stopShare();return}
+  if(!S.isHost){toast('Only the host can share their screen');return}
   if(!canScreenShare()){
     toast('This browser does not support screen sharing. Try desktop Chrome/Edge or a supported Android browser.',5200);
     sysMsg('Screen share unavailable on this browser');
@@ -1347,6 +1572,9 @@ async function toggleShare(){
     SS.stream=stream;
     SS.isSharing=true;
     SS.role='sharer';
+    CONN.streamConnected=false;
+    CONN.streamRetries=0;
+    monitorConnectionQuality();
 
     // Show local preview
     await bindScreenVideo(stream,true);
@@ -1378,12 +1606,17 @@ function stopShare(){
   if(SS.stream){SS.stream.getTracks().forEach(t=>t.stop());SS.stream=null}
   resetPeerConnection();
   SS.isSharing=false;SS.role=null;
+  CONN.streamConnected=false;
+  CONN.streamRetries=0;
+  stopConnectionQualityMonitor();
 
   // Reset video area
   const vid=document.getElementById('screen-video');
   vid.srcObject=null;vid.style.display='none';
   document.getElementById('vph').style.display='flex';
   document.getElementById('remote-screen').style.display='none';
+  const remoteText=document.getElementById('remote-screen-text');
+  if(remoteText)remoteText.textContent='Connecting to screen share...';
   document.getElementById('np').style.display='none';
   document.getElementById('ss-btn').style.display='flex';
   document.getElementById('ss-stop-btn').style.display='none';
@@ -1439,10 +1672,27 @@ async function startWebRTC(role,stream,targetPeerId){
     }
     sendSignal(msg);
   };
+  SS.pc.onconnectionstatechange=()=>{
+    const st=SS.pc&&SS.pc.connectionState;
+    if(st==='connected'){
+      CONN.streamConnected=true;
+      CONN.streamRetries=0;
+      monitorConnectionQuality();
+      return;
+    }
+    if(st==='disconnected'||st==='failed'||st==='closed'){
+      CONN.streamConnected=false;
+      stopConnectionQualityMonitor();
+      if(SS.role==='viewer'&&hasOpenDataConn())scheduleStreamReconnect();
+    }
+  };
 
   if(role==='viewer'){
     SS.pc.ontrack=e=>{
       bindScreenVideo(e.streams[0],false);
+      CONN.streamConnected=true;
+      CONN.streamRetries=0;
+      monitorConnectionQuality();
       document.getElementById('remote-screen').style.display='none';
       setSSStatus('👁 Watching '+S.partnerName+'\'s screen','var(--violet)');
       sysMsg('Screen share connected 🎉');
@@ -1461,19 +1711,23 @@ async function startWebRTC(role,stream,targetPeerId){
   }
 }
 
-async function viewerJoin(){
+async function viewerJoin(autoRetry=false){
   if(canUsePeerTransport()){
     initPeerTransport();
     ensureViewerDataConn();
     if(!NET.peer||!NET.ready){
-      toast('Connecting… try Watch again in a moment.');
+      if(!autoRetry)toast('Connecting… try Watch again in a moment.');
       return;
     }
+    if(!autoRetry)CONN.streamRetries=0;
     SS.role='viewer';
+    CONN.streamConnected=false;
     document.getElementById('vph').style.display='none';
     document.getElementById('remote-screen').style.display='flex';
+    const remoteText=document.getElementById('remote-screen-text');
+    if(remoteText)remoteText.textContent=autoRetry?'Reconnecting to stream...':'Connecting to screen share...';
     document.getElementById('ss-btn').style.display='none';
-    setSSStatus('📡 Connecting to host…','var(--violet)');
+    setSSStatus(autoRetry?'Reconnecting to stream...':'Connecting to host screen...','var(--violet)');
     document.getElementById('np').style.display='flex';
     document.getElementById('np-text').textContent='👁 Watching '+(S.partnerName||'host')+'\'s screen';
     await startWebRTC('viewer');
@@ -1484,6 +1738,7 @@ async function viewerJoin(){
     if(NET.watchRequestConn&&NET.watchRequestConn.open){sendReq()}
     else if(NET.watchRequestConn){NET.watchRequestConn.on('open',sendReq)}
     NET.watchRequestConn.on('error',()=>{
+      if(autoRetry){scheduleStreamReconnect();return}
       toast('Could not reach host yet. Try Watch again.');
       document.getElementById('ss-btn').style.display='flex';
       document.getElementById('remote-screen').style.display='none';
@@ -1492,6 +1747,7 @@ async function viewerJoin(){
     });
     clearTimeout(NET.connectTimer);
     NET.connectTimer=setTimeout(()=>{
+      if(autoRetry){scheduleStreamReconnect();return}
       toast('Host stream not received yet. Ask host to restart sharing, then tap Watch again.',5500);
       document.getElementById('ss-btn').style.display='flex';
       document.getElementById('remote-screen').style.display='none';
@@ -1523,9 +1779,14 @@ function incomingSsStop(name){
   sysMsg(name+' stopped sharing 🛑');
   resetPeerConnection();
   SS.role=null;
+  CONN.streamConnected=false;
+  CONN.streamRetries=0;
+  stopConnectionQualityMonitor();
   const vid=document.getElementById('screen-video');
   vid.srcObject=null;vid.style.display='none';
   document.getElementById('remote-screen').style.display='none';
+  const remoteText=document.getElementById('remote-screen-text');
+  if(remoteText)remoteText.textContent='Connecting to screen share...';
   document.getElementById('vph').style.display='flex';
   document.getElementById('np').style.display='none';
   setSSStatus('No screen shared yet','var(--text3)');
@@ -1636,6 +1897,13 @@ function closeModal(){document.getElementById('leave-modal').classList.remove('o
 function doLeave(){
   broadcast({type:'leave',name:S.myName});
   window.removeEventListener('storage',onStore);
+  stopConnectionQualityMonitor();
+  setReconnectBanner(false);
+  CONN.quality='unknown';
+  CONN.dataConnected=false;
+  CONN.streamConnected=false;
+  CONN.streamRetries=0;
+  CONN._dataReconnectPending=false;
   clearTimeout(NET.connectTimer);
   NET.connectTimer=null;
   if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
@@ -1661,6 +1929,8 @@ showPage('landing');
 </script>
 </body>
 </html>
+
+
 
 
 
