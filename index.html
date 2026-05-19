@@ -730,6 +730,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
     <div class="rh-quality" id="conn-quality">
       <span id="conn-quality-text">&#128246; Good</span>
     </div>
+    <button class="rh-leave" id="retry-conn-btn" onclick="manualRetryConnection()" style="display:none">🔄 Retry</button>
     <button class="rh-leave" onclick="leaveConfirm()">🚪 Leave</button>
   </div>
 
@@ -872,7 +873,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* -- STATE -- */
 let S={myName:'',partnerName:'',roomName:'',roomCode:'',isHost:false,messages:[],notes:'',snacks:[],myMood:'',partnerMood:'',videoUrl:''};
 const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
-let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0};
+let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:''};
 const CONN={
   quality:'unknown',
   dataConnected:false,
@@ -881,7 +882,7 @@ const CONN={
   qualityInterval:null,
   reconnectBanner:null
 };
-let msgQueue=[];
+let MSG_QUEUE=[];
 const SEEN_SYNC=new Set();
 const QS=new URLSearchParams(location.search);
 const PEER_CFG={
@@ -894,12 +895,14 @@ const PEER_CFG={
 function setConnBadge(state,text){
   const el=document.getElementById('conn-badge');
   const tx=document.getElementById('conn-badge-text');
+  const retryBtn=document.getElementById('retry-conn-btn');
   if(!el||!tx)return;
   el.classList.remove('online','warn','offline');
   if(state==='online')el.classList.add('online');
   else if(state==='warn')el.classList.add('warn');
   else el.classList.add('offline');
   tx.textContent=text;
+  if(retryBtn)retryBtn.style.display=state==='online'?'none':'flex';
 }
 function setReconnectBanner(show){
   if(!CONN.reconnectBanner)CONN.reconnectBanner=document.getElementById('reconnect-banner');
@@ -911,6 +914,28 @@ function hasOpenDataConn(){
     if(conn&&conn.open)return true;
   }
   return false;
+}
+function safeSend(conn,data){
+  if(!conn)return false;
+  if(conn.open){
+    try{
+      conn.send(data);
+      return true;
+    }catch(e){
+      MSG_QUEUE.push(data);
+      return false;
+    }
+  }
+  MSG_QUEUE.push(data);
+  return false;
+}
+function flushMsgQueue(conn){
+  if(!conn||!conn.open)return;
+  const toSend=[...MSG_QUEUE];
+  MSG_QUEUE=[];
+  toSend.forEach(data=>{
+    try{conn.send(data)}catch(e){MSG_QUEUE.push(data)}
+  });
 }
 function setQualityBadge(quality){
   const badge=document.getElementById('conn-quality');
@@ -1034,7 +1059,6 @@ function schedulePeerReconnect(reason){
     initPeerTransport();
   },delay);
 }
-
 /* -- PAGES -- */
 function showPage(p){
   ['landing','lobby','room'].forEach(id=>{
@@ -1169,23 +1193,36 @@ function setupRoleButtons(){
   btn.classList.remove('disabled');
   setSSStatus('Waiting for host stream — tap Watch','var(--text3)');
 }
-function initPeerTransport(){
-  if(!canUsePeerTransport())return;
-  if(NET.peer)return;
-  const desiredId=S.isHost?hostPeerId():undefined;
-  setConnBadge('warn','Relay connecting…');
-  try{
-    NET.peer=new Peer(desiredId,{
-      host:PEER_CFG.host,
-      port:PEER_CFG.port,
-      path:PEER_CFG.path,
-      secure:PEER_CFG.secure
-    });
-  }catch(e){
-    NET.lastError=e.message||'peer init failed';
-    setConnBadge('offline','Relay error');
+function manualRetryConnection(){
+  toast('Retrying connection...');
+  if(S.isHost){
+    if(NET.peer){try{NET.peer.destroy()}catch(e){}}
+    NET.peer=null;
+    NET.ready=false;
+    initPeerTransport();
     return;
   }
+  ensureViewerDataConn();
+}
+function stopHostPresenceAnnouncements(){
+  if(NET.hostAnnounceTimer){
+    clearInterval(NET.hostAnnounceTimer);
+    NET.hostAnnounceTimer=null;
+  }
+}
+function startHostPresenceAnnouncements(){
+  if(!S.isHost)return;
+  stopHostPresenceAnnouncements();
+  let sent=0;
+  NET.hostAnnounceTimer=setInterval(()=>{
+    if(!S.isHost){stopHostPresenceAnnouncements();return}
+    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+    sent+=1;
+    if(sent>=5)stopHostPresenceAnnouncements();
+  },8000);
+}
+function setupPeerEvents(){
+  if(!NET.peer)return;
   NET.peer.on('open',()=>{
     const wasReconnecting=(NET.retries||0)>0||!!NET.reconnectTimer;
     NET.ready=true;
@@ -1196,16 +1233,31 @@ function initPeerTransport(){
     setConnBadge('online','Relay connected');
     if(wasReconnecting)toast('Back online ✅');
     if(!S.isHost){setupRoleButtons();ensureViewerDataConn()}
-    if(S.isHost)broadcast({type:'join',name:S.myName});
+    if(S.isHost){
+      broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+      startHostPresenceAnnouncements();
+    }
   });
   NET.peer.on('error',err=>{
-    NET.lastError=(err&&err.type)||err.message||'peer error';
-    setConnBadge('warn','Relay issue');
-    if(S.isHost&&NET.lastError==='unavailable-id'){
-      toast('This room code is already active in another host tab/device.',5200);
-      setConnBadge('offline','Relay ID conflict');
+    if(S.isHost&&err&&err.type==='unavailable-id'){
+      const fallbackId=hostPeerId()+'_b';
+      try{NET.peer.destroy()}catch(e){}
+      NET.peer=null;
+      NET.ready=false;
+      setConnBadge('warn','Retrying host ID...');
+      setTimeout(()=>{
+        NET.peer=new Peer(fallbackId,{
+          host:'0.peerjs.com',
+          port:443,
+          path:'/',
+          secure:true
+        });
+        setupPeerEvents();
+      },500);
       return;
     }
+    NET.lastError=(err&&err.type)||err.message||'peer error';
+    setConnBadge('warn','Relay issue');
     schedulePeerReconnect(NET.lastError);
   });
   NET.peer.on('disconnected',()=>{
@@ -1254,43 +1306,47 @@ function initPeerTransport(){
     });
   });
 }
+function initPeerTransport(){
+  if(!canUsePeerTransport())return;
+  if(NET.peer)return;
+  const desiredId=S.isHost?hostPeerId():undefined;
+  setConnBadge('warn','Relay connecting…');
+  try{
+    NET.peer=new Peer(desiredId,{
+      host:PEER_CFG.host,
+      port:PEER_CFG.port,
+      path:PEER_CFG.path,
+      secure:PEER_CFG.secure
+    });
+  }catch(e){
+    NET.lastError=e.message||'peer init failed';
+    setConnBadge('offline','Relay error');
+    return;
+  }
+  setupPeerEvents();
+}
 function registerPeerConn(conn){
   if(!conn)return;
   NET.dataConns.set(conn.peer,conn);
   if(!S.isHost)NET.watchRequestConn=conn;
   conn.on('open',()=>{
-    const wasReconnect=!!CONN._dataReconnectPending;
     CONN.dataConnected=true;
-    if(msgQueue.length){
-      const pending=[...msgQueue];
-      msgQueue=[];
-      pending.forEach(m=>{
-        try{conn.send(m)}catch(e){msgQueue.push(m)}
-      });
-    }
-    if(wasReconnect){
-      CONN._dataReconnectPending=false;
-      setConnBadge('online','Relay connected');
-      toast('Reconnected ✅');
-      broadcast({type:'join',name:S.myName});
-    }
-    broadcast({type:'join',name:S.myName});
+    NET.connectingToHost=false;
+    flushMsgQueue(conn);
+    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
   });
   conn.on('data',data=>handlePeerData(conn,data));
-  conn.on('close',()=>{
+  conn.on('error',()=>{
+    NET.connectingToHost=false;
     if(NET.dataConns.get(conn.peer)===conn)NET.dataConns.delete(conn.peer);
     if(NET.watchRequestConn===conn)NET.watchRequestConn=null;
     CONN.dataConnected=hasOpenDataConn();
-    if(!CONN.dataConnected&&!S.isHost){
-      CONN._dataReconnectPending=true;
-      setTimeout(()=>{
-        if(!CONN.dataConnected&&SS.role==='viewer'){
-          setConnBadge('warn','Reconnecting...');
-          toast('Connection lost. Reconnecting...');
-          ensureViewerDataConn();
-        }
-      },2000);
-    }
+  });
+  conn.on('close',()=>{
+    NET.connectingToHost=false;
+    if(NET.dataConns.get(conn.peer)===conn)NET.dataConns.delete(conn.peer);
+    if(NET.watchRequestConn===conn)NET.watchRequestConn=null;
+    CONN.dataConnected=hasOpenDataConn();
   });
 }
 async function handlePeerData(conn,data){
@@ -1347,17 +1403,86 @@ async function handlePeerData(conn,data){
   }
 }
 function ensureViewerDataConn(){
-  if(S.isHost||!NET.peer||!NET.ready)return;
-  const hostId=hostPeerId();
+  if(S.isHost)return;
+  if(NET.connectingToHost)return;
+  if(!NET.peer||!NET.ready){
+    setTimeout(ensureViewerDataConn,1000);
+    return;
+  }
+  NET.connectingToHost=true;
+  const hostId=NET.hostPeerOverride||hostPeerId();
   const existing=NET.dataConns.get(hostId);
-  if(existing&&existing.open){NET.watchRequestConn=existing;CONN.dataConnected=true;return}
-  const conn=NET.peer.connect(hostId,{reliable:true});
-  NET.watchRequestConn=conn;
-  registerPeerConn(conn);
-  conn.on('open',()=>{
-    // Re-announce join after data channel opens so host receives partner state on cross-device sessions.
-    broadcast({type:'join',name:S.myName});
+  if(existing&&existing.open){
+    NET.watchRequestConn=existing;
+    CONN.dataConnected=true;
+    NET.connectingToHost=false;
+    return;
+  }
+  if(existing&&!existing.open){
+    try{existing.close()}catch(e){}
+    NET.dataConns.delete(hostId);
+  }
+  setConnBadge('warn','Connecting to host...');
+  const conn=NET.peer.connect(hostId,{
+    reliable:true,
+    serialization:'json'
   });
+  NET.dataConns.set(hostId,conn);
+  NET.watchRequestConn=conn;
+
+  let opened=false;
+
+  conn.on('open',()=>{
+    opened=true;
+    NET.connectingToHost=false;
+    CONN.dataConnected=true;
+    NET.watchRequestConn=conn;
+    flushMsgQueue(conn);
+    setConnBadge('online','Connected to host');
+    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+    if(NET.hasEverConnected)sysMsg('✅ Reconnected!');
+    else sysMsg('✅ Connected to '+(S.partnerName||'host')+'!');
+    NET.hasEverConnected=true;
+    toast('Connected to host ✅');
+  });
+
+  conn.on('data',data=>handlePeerData(conn,data));
+
+  conn.on('error',err=>{
+    NET.connectingToHost=false;
+    CONN.dataConnected=false;
+    NET.dataConns.delete(hostId);
+    NET.watchRequestConn=null;
+    setConnBadge('warn','Retrying...');
+    setTimeout(ensureViewerDataConn,2000);
+  });
+
+  conn.on('close',()=>{
+    NET.connectingToHost=false;
+    CONN.dataConnected=false;
+    if(NET.dataConns.get(hostId)===conn){
+      NET.dataConns.delete(hostId);
+    }
+    if(NET.watchRequestConn===conn){
+      NET.watchRequestConn=null;
+    }
+    setConnBadge('warn','Disconnected');
+    sysMsg('⚠️ Connection lost. Reconnecting...');
+    setTimeout(ensureViewerDataConn,2000);
+  });
+
+  setTimeout(()=>{
+    if(!opened){
+      NET.connectingToHost=false;
+      CONN.dataConnected=false;
+      try{conn.close()}catch(e){}
+      NET.dataConns.delete(hostId);
+      NET.watchRequestConn=null;
+      setConnBadge('warn','Retrying connection...');
+      toast('Host not reachable yet. Retrying...');
+      setTimeout(ensureViewerDataConn,2500);
+    }
+  },5000);
 }
 function startPeerStreamToViewer(viewerId){
   if(!SS.stream||!viewerId)return;
@@ -1371,6 +1496,9 @@ function initRoom(){
   CONN.reconnectBanner=document.getElementById('reconnect-banner');
   setReconnectBanner(false);
   stopConnectionQualityMonitor();
+  NET.connectingToHost=false;
+  NET.hasEverConnected=false;
+  if(!S.isHost)NET.hostPeerOverride='';
   CONN.dataConnected=hasOpenDataConn();
   CONN.streamConnected=false;
   CONN.streamRetries=0;
@@ -1387,31 +1515,33 @@ function initRoom(){
   setTimeout(()=>{
     const badge=document.getElementById('partner-badge');
     if(badge&&/^Waiting/i.test((badge.textContent||'').trim())){
-      broadcast({type:'join',name:S.myName});
+      broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
     }
   },3000);
   sysMsg('Welcome to '+S.roomName+' 💖');
-  if(!S.isHost)sysMsg('Waiting for host...');
+  if(!S.isHost){}
   if(S.isHost)sysMsg('Share code '+S.roomCode+' with your partner');
+  if(!S.isHost){
+    sysMsg('🔌 Connecting to host...');
+    setTimeout(()=>{if(!CONN.dataConnected)sysMsg('⏳ Still trying to reach host...')},3000);
+    setTimeout(()=>{if(!CONN.dataConnected)sysMsg('🔄 Retrying connection...')},6000);
+  }
 }
 
 /* -- SYNC -- */
 function broadcast(d){
   const k='sd_m_'+S.roomCode;
   const p={...d,from:S.myName,ts:Date.now(),id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)};
+  const payload={type:'sync',payload:p};
   localStorage.setItem(k,JSON.stringify(p));
   setTimeout(()=>{try{if(localStorage.getItem(k)===JSON.stringify(p))localStorage.removeItem(k)}catch(e){}},5000);
   let hasConn=false;
   for(const conn of NET.dataConns.values()){
     if(!conn)continue;
     hasConn=true;
-    if(conn&&conn.open){
-      try{conn.send({type:'sync',payload:p})}catch(e){msgQueue.push({type:'sync',payload:p})}
-    }else{
-      msgQueue.push({type:'sync',payload:p});
-    }
+    safeSend(conn,payload);
   }
-  if(!hasConn)msgQueue.push({type:'sync',payload:p});
+  if(!hasConn)MSG_QUEUE.push(payload);
 }
 function onStore(e){
   if(!e.key||!e.key.startsWith('sd_m_'+S.roomCode)||!e.newValue)return;
@@ -1430,9 +1560,11 @@ function processSyncMessage(d){
   }
   if(d.type==='join'){
     S.partnerName=d.name;document.getElementById('partner-badge').textContent=d.name;
+    if(!S.isHost&&d.peerId)NET.hostPeerOverride=d.peerId;
     sysMsg(d.name+' joined 💫');
     if(S.isHost){
-      broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing});
+      stopHostPresenceAnnouncements();
+      broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
     }
     if(S.videoUrl)broadcast({type:'video',url:S.videoUrl});
   }else if(d.type==='welcome'){
@@ -1440,6 +1572,7 @@ function processSyncMessage(d){
       S.partnerName=d.hostName;
       document.getElementById('partner-badge').textContent=d.hostName;
     }
+    if(!S.isHost&&d.peerId)NET.hostPeerOverride=d.peerId;
     if(d.roomName){
       S.roomName=d.roomName;
       document.getElementById('rh-name').textContent='💞 '+S.roomName;
@@ -1734,7 +1867,10 @@ async function viewerJoin(autoRetry=false){
     if(!NET.watchRequestConn||!NET.watchRequestConn.open){
       ensureViewerDataConn();
     }
-    const sendReq=()=>{try{NET.watchRequestConn.send({type:'watch_request',viewerId:NET.peer.id,name:S.myName})}catch(e){}};
+    const sendReq=()=>{
+      flushMsgQueue(NET.watchRequestConn);
+      safeSend(NET.watchRequestConn,{type:'watch_request',viewerId:NET.peer.id,name:S.myName});
+    };
     if(NET.watchRequestConn&&NET.watchRequestConn.open){sendReq()}
     else if(NET.watchRequestConn){NET.watchRequestConn.on('open',sendReq)}
     NET.watchRequestConn.on('error',()=>{
@@ -1897,6 +2033,7 @@ function closeModal(){document.getElementById('leave-modal').classList.remove('o
 function doLeave(){
   broadcast({type:'leave',name:S.myName});
   window.removeEventListener('storage',onStore);
+  stopHostPresenceAnnouncements();
   stopConnectionQualityMonitor();
   setReconnectBanner(false);
   CONN.quality='unknown';
@@ -1904,6 +2041,7 @@ function doLeave(){
   CONN.streamConnected=false;
   CONN.streamRetries=0;
   CONN._dataReconnectPending=false;
+  NET.connectingToHost=false;
   clearTimeout(NET.connectTimer);
   NET.connectTimer=null;
   if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
@@ -1912,7 +2050,7 @@ function doLeave(){
   NET.dataConns.clear();
   if(NET.currentCall){try{NET.currentCall.close()}catch(e){}}
   if(NET.peer){try{NET.peer.destroy()}catch(e){}}
-  NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0};
+  NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:''};
   setConnBadge('offline','Relay offline');
   closeModal();showPage('landing');
 }
@@ -1929,6 +2067,7 @@ showPage('landing');
 </script>
 </body>
 </html>
+
 
 
 
