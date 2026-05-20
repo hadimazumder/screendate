@@ -873,7 +873,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* -- STATE -- */
 let S={myName:'',partnerName:'',roomName:'',roomCode:'',isHost:false,messages:[],notes:'',snacks:[],myMood:'',partnerMood:'',videoUrl:''};
 const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
-let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:''};
+let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:'',peerOpenTime:0};
 const CONN={
   quality:'unknown',
   dataConnected:false,
@@ -885,13 +885,12 @@ const CONN={
 let MSG_QUEUE=[];
 const SEEN_SYNC=new Set();
 const QS=new URLSearchParams(location.search);
-const PEER_CFG={
-  host:'0.peerjs.com',
-  port:443,
-  path:'/',
-  secure:true
+const PEER_CFG = {
+  host: 'peerjs-server-production-7a71.up.railway.app',
+  port: 443,
+  path: '/peer',
+  secure: true
 };
-
 function setConnBadge(state,text){
   const el=document.getElementById('conn-badge');
   const tx=document.getElementById('conn-badge-text');
@@ -1047,20 +1046,18 @@ function schedulePeerReconnect(reason){
   if(NET.reconnectTimer)return;
   setReconnectBanner(true);
   CONN.dataConnected=false;
-  NET.connectingToHost=false;
-  NET.watchRequestConn=null;
   NET.retries=(NET.retries||0)+1;
-  const delay=Math.min(12000,900*Math.pow(1.6,NET.retries));
-  setConnBadge('warn','Relay reconnecting…');
+
+
+
+  const delay=Math.min(8000,1000*NET.retries);
+  setConnBadge('warn','Relay reconnecting...');
   NET.reconnectTimer=setTimeout(()=>{
     NET.reconnectTimer=null;
-    const oldPeer=NET.peer;
+    if(NET.peer){try{NET.peer.destroy()}catch(e){}}
     NET.peer=null;
     NET.ready=false;
-    NET.connectingToHost=false;
-    NET.watchRequestConn=null;
     NET.dataConns=new Map();
-    if(oldPeer){try{oldPeer.destroy()}catch(e){}}
     initPeerTransport();
   },delay);
 }
@@ -1233,6 +1230,8 @@ function setupPeerEvents(){
     if(NET.peer!==peer)return;
     const wasReconnecting=(NET.retries||0)>0||!!NET.reconnectTimer;
     NET.ready=true;
+    NET.peerOpenTime=Date.now();
+    NET.hasEverConnected=true;
     CONN.dataConnected=hasOpenDataConn();
     NET.retries=0;
     if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
@@ -1247,6 +1246,7 @@ function setupPeerEvents(){
   });
   peer.on('error',err=>{
     if(NET.peer!==peer)return;
+
     if(S.isHost&&err&&err.type==='unavailable-id'){
       if(NET.peer===peer)NET.peer=null;
       NET.ready=false;
@@ -1271,6 +1271,7 @@ function setupPeerEvents(){
   });
   peer.on('close',()=>{
     if(NET.peer!==peer)return;
+
     NET.ready=false;
     CONN.dataConnected=false;
     NET.connectingToHost=false;
@@ -1278,6 +1279,7 @@ function setupPeerEvents(){
     NET.dataConns=new Map();
     NET.peer=null;
     setConnBadge('offline','Relay closed');
+
     schedulePeerReconnect('closed');
   });
   peer.on('connection',conn=>{
@@ -1328,12 +1330,7 @@ function initPeerTransport(){
   const desiredId=S.isHost?hostPeerId():undefined;
   setConnBadge('warn','Relay connecting…');
   try{
-    NET.peer=new Peer(desiredId,{
-      host:PEER_CFG.host,
-      port:PEER_CFG.port,
-      path:PEER_CFG.path,
-      secure:PEER_CFG.secure
-    });
+    NET.peer=new Peer(desiredId,PEER_CFG);
   }catch(e){
     NET.lastError=e.message||'peer init failed';
     setConnBadge('offline','Relay error');
@@ -2078,7 +2075,7 @@ function doLeave(){
   NET.dataConns.clear();
   if(NET.currentCall){try{NET.currentCall.close()}catch(e){}}
   if(NET.peer){try{NET.peer.destroy()}catch(e){}}
-  NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:''};
+  NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:'',peerOpenTime:0};
   setConnBadge('offline','Relay offline');
   closeModal();showPage('landing');
 }
