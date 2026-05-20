@@ -1327,6 +1327,8 @@ function initPeerTransport(){
 }
 function registerPeerConn(conn){
   if(!conn)return;
+  if(conn._registered)return;
+  conn._registered=true;
   NET.dataConns.set(conn.peer,conn);
   if(!S.isHost)NET.watchRequestConn=conn;
   conn.on('open',()=>{
@@ -1431,6 +1433,7 @@ function ensureViewerDataConn(){
   NET.watchRequestConn=conn;
 
   let opened=false;
+  conn._registered=true;
 
   conn.on('open',()=>{
     opened=true;
