@@ -1047,15 +1047,20 @@ function schedulePeerReconnect(reason){
   if(NET.reconnectTimer)return;
   setReconnectBanner(true);
   CONN.dataConnected=false;
+  NET.connectingToHost=false;
+  NET.watchRequestConn=null;
   NET.retries=(NET.retries||0)+1;
   const delay=Math.min(12000,900*Math.pow(1.6,NET.retries));
   setConnBadge('warn','Relay reconnecting…');
   NET.reconnectTimer=setTimeout(()=>{
     NET.reconnectTimer=null;
-    if(NET.peer){try{NET.peer.destroy()}catch(e){}}
+    const oldPeer=NET.peer;
     NET.peer=null;
     NET.ready=false;
+    NET.connectingToHost=false;
+    NET.watchRequestConn=null;
     NET.dataConns=new Map();
+    if(oldPeer){try{oldPeer.destroy()}catch(e){}}
     initPeerTransport();
   },delay);
 }
@@ -1195,14 +1200,14 @@ function setupRoleButtons(){
 }
 function manualRetryConnection(){
   toast('Retrying connection...');
-  if(S.isHost){
-    if(NET.peer){try{NET.peer.destroy()}catch(e){}}
-    NET.peer=null;
-    NET.ready=false;
-    initPeerTransport();
-    return;
-  }
-  ensureViewerDataConn();
+  const oldPeer=NET.peer;
+  NET.peer=null;
+  NET.ready=false;
+  NET.connectingToHost=false;
+  NET.watchRequestConn=null;
+  NET.dataConns=new Map();
+  if(oldPeer){try{oldPeer.destroy()}catch(e){}}
+  initPeerTransport();
 }
 function stopHostPresenceAnnouncements(){
   if(NET.hostAnnounceTimer){
@@ -1223,7 +1228,9 @@ function startHostPresenceAnnouncements(){
 }
 function setupPeerEvents(){
   if(!NET.peer)return;
-  NET.peer.on('open',()=>{
+  const peer=NET.peer;
+  peer.on('open',()=>{
+    if(NET.peer!==peer)return;
     const wasReconnecting=(NET.retries||0)>0||!!NET.reconnectTimer;
     NET.ready=true;
     CONN.dataConnected=hasOpenDataConn();
@@ -1238,41 +1245,47 @@ function setupPeerEvents(){
       startHostPresenceAnnouncements();
     }
   });
-  NET.peer.on('error',err=>{
+  peer.on('error',err=>{
+    if(NET.peer!==peer)return;
     if(S.isHost&&err&&err.type==='unavailable-id'){
-      const fallbackId=hostPeerId()+'_b';
-      try{NET.peer.destroy()}catch(e){}
-      NET.peer=null;
+      if(NET.peer===peer)NET.peer=null;
       NET.ready=false;
+      NET.connectingToHost=false;
       setConnBadge('warn','Retrying host ID...');
+      try{peer.destroy()}catch(e){}
       setTimeout(()=>{
-        NET.peer=new Peer(fallbackId,{
-          host:'0.peerjs.com',
-          port:443,
-          path:'/',
-          secure:true
-        });
-        setupPeerEvents();
-      },500);
+        if(!NET.peer)initPeerTransport();
+      },1200);
       return;
     }
     NET.lastError=(err&&err.type)||err.message||'peer error';
     setConnBadge('warn','Relay issue');
     schedulePeerReconnect(NET.lastError);
   });
-  NET.peer.on('disconnected',()=>{
+  peer.on('disconnected',()=>{
+    if(NET.peer!==peer)return;
     NET.ready=false;
     CONN.dataConnected=false;
     setConnBadge('warn','Relay disconnected');
     schedulePeerReconnect('disconnected');
   });
-  NET.peer.on('close',()=>{
+  peer.on('close',()=>{
+    if(NET.peer!==peer)return;
     NET.ready=false;
     CONN.dataConnected=false;
+    NET.connectingToHost=false;
+    NET.watchRequestConn=null;
+    NET.dataConns=new Map();
+    NET.peer=null;
     setConnBadge('offline','Relay closed');
+    schedulePeerReconnect('closed');
   });
-  NET.peer.on('connection',conn=>registerPeerConn(conn));
-  NET.peer.on('call',call=>{
+  peer.on('connection',conn=>{
+    if(NET.peer!==peer)return;
+    registerPeerConn(conn);
+  });
+  peer.on('call',call=>{
+    if(NET.peer!==peer){try{call.close()}catch(e){};return}
     if(S.isHost){
       if(!SS.stream){call.close();return}
       try{call.answer(SS.stream)}catch(e){call.close();return}
@@ -1308,7 +1321,10 @@ function setupPeerEvents(){
 }
 function initPeerTransport(){
   if(!canUsePeerTransport())return;
-  if(NET.peer)return;
+  if(NET.peer){
+    if(!NET.peer.destroyed)return;
+    NET.peer=null;
+  }
   const desiredId=S.isHost?hostPeerId():undefined;
   setConnBadge('warn','Relay connecting…');
   try{
