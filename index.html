@@ -868,12 +868,30 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 <div id="toast"><span class="tdot"></span><span id="toast-msg"></span></div>
 <div class="powered-by">Powered by Digital Arrow</div>
 
-<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
 <script>
 /* -- STATE -- */
 let S={myName:'',partnerName:'',roomName:'',roomCode:'',isHost:false,messages:[],notes:'',snacks:[],myMood:'',partnerMood:'',videoUrl:''};
 const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
-let NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:'',peerOpenTime:0};
+let NET = {
+  ably: null,
+  channel: null,
+  ready: false,
+  dataConnected: false,
+  connectingToHost: false,
+  hasEverConnected: false,
+  reconnectTimer: null,
+  retries: 0,
+  hostPeerOverride: '',
+  currentCall: null,
+  connectTimer: null,
+  pendingViewers: new Set(),
+  watchRequestConn: null,
+  dataConns: new Map(),
+  hostAnnounceTimer: null,
+  peerOpenTime: 0,
+  lastError: ''
+};
 const CONN={
   quality:'unknown',
   dataConnected:false,
@@ -885,12 +903,6 @@ const CONN={
 let MSG_QUEUE=[];
 const SEEN_SYNC=new Set();
 const QS=new URLSearchParams(location.search);
-const PEER_CFG = {
-  host: 'peerjs-server-production-7a71.up.railway.app',
-  port: 443,
-  path: '/peer',
-  secure: true
-};
 function setConnBadge(state,text){
   const el=document.getElementById('conn-badge');
   const tx=document.getElementById('conn-badge-text');
@@ -909,32 +921,7 @@ function setReconnectBanner(show){
   CONN.reconnectBanner.style.display=show?'block':'none';
 }
 function hasOpenDataConn(){
-  for(const conn of NET.dataConns.values()){
-    if(conn&&conn.open)return true;
-  }
-  return false;
-}
-function safeSend(conn,data){
-  if(!conn)return false;
-  if(conn.open){
-    try{
-      conn.send(data);
-      return true;
-    }catch(e){
-      MSG_QUEUE.push(data);
-      return false;
-    }
-  }
-  MSG_QUEUE.push(data);
-  return false;
-}
-function flushMsgQueue(conn){
-  if(!conn||!conn.open)return;
-  const toSend=[...MSG_QUEUE];
-  MSG_QUEUE=[];
-  toSend.forEach(data=>{
-    try{conn.send(data)}catch(e){MSG_QUEUE.push(data)}
-  });
+  return NET.dataConnected && NET.channel !== null;
 }
 function setQualityBadge(quality){
   const badge=document.getElementById('conn-quality');
@@ -964,9 +951,6 @@ function stopConnectionQualityMonitor(){
 }
 function getActiveStatsPeerConnection(){
   if(SS&&SS.pc&&typeof SS.pc.getStats==='function')return SS.pc;
-  if(!NET.currentCall)return null;
-  const callPc=NET.currentCall.peerConnection||NET.currentCall._pc||NET.currentCall.pc||null;
-  if(callPc&&typeof callPc.getStats==='function')return callPc;
   return null;
 }
 async function sampleConnectionQuality(){
@@ -1042,23 +1026,22 @@ function scheduleStreamReconnect(){
   },3000);
 }
 function schedulePeerReconnect(reason){
-  if(!canUsePeerTransport())return;
   if(NET.reconnectTimer)return;
   setReconnectBanner(true);
-  CONN.dataConnected=false;
   NET.retries=(NET.retries||0)+1;
-
-
-
   const delay=Math.min(8000,1000*NET.retries);
-  setConnBadge('warn','Relay reconnecting...');
+  setConnBadge('warn','Reconnecting...');
   NET.reconnectTimer=setTimeout(()=>{
     NET.reconnectTimer=null;
-    if(NET.peer){try{NET.peer.destroy()}catch(e){}}
-    NET.peer=null;
+    if(NET.ably){
+      try{NET.ably.close()}catch(e){}
+    }
+    NET.ably=null;
+    NET.channel=null;
     NET.ready=false;
-    NET.dataConns=new Map();
-    initPeerTransport();
+    NET.dataConnected=false;
+    CONN.dataConnected=false;
+    initAblyTransport();
   },delay);
 }
 /* -- PAGES -- */
@@ -1174,11 +1157,8 @@ function candidatesSafeFromStorage(rawRoom){
   }catch(e){}
   return '';
 }
-function hostPeerId(){
-  return 'sdhost'+(S.roomCode||'').toLowerCase()
-}
 function canUsePeerTransport(){
-  return typeof window.Peer==='function';
+  return typeof Ably !== 'undefined';
 }
 function setupRoleButtons(){
   const btn=document.getElementById('ss-btn');
@@ -1199,14 +1179,15 @@ function setupRoleButtons(){
 }
 function manualRetryConnection(){
   toast('Retrying connection...');
-  const oldPeer=NET.peer;
-  NET.peer=null;
+  if(NET.ably){
+    try{NET.ably.close()}catch(e){}
+  }
+  NET.ably=null;
+  NET.channel=null;
   NET.ready=false;
-  NET.connectingToHost=false;
-  NET.watchRequestConn=null;
-  NET.dataConns=new Map();
-  if(oldPeer){try{oldPeer.destroy()}catch(e){}}
-  initPeerTransport();
+  NET.dataConnected=false;
+  CONN.dataConnected=false;
+  initAblyTransport();
 }
 function stopHostPresenceAnnouncements(){
   if(NET.hostAnnounceTimer){
@@ -1220,293 +1201,152 @@ function startHostPresenceAnnouncements(){
   let sent=0;
   NET.hostAnnounceTimer=setInterval(()=>{
     if(!S.isHost){stopHostPresenceAnnouncements();return}
-    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+    broadcast({type:'join',name:S.myName});
     sent+=1;
     if(sent>=5)stopHostPresenceAnnouncements();
   },8000);
 }
-function setupPeerEvents(){
-  if(!NET.peer)return;
-  const peer=NET.peer;
-  peer.on('open',()=>{
-    if(NET.peer!==peer)return;
-    const wasReconnecting=(NET.retries||0)>0||!!NET.reconnectTimer;
-    NET.ready=true;
-    NET.peerOpenTime=Date.now();
-    NET.hasEverConnected=true;
-    CONN.dataConnected=hasOpenDataConn();
-    NET.retries=0;
-    if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
-    setReconnectBanner(false);
-    setConnBadge('online','Relay connected');
-    if(wasReconnecting)toast('Back online ✅');
-    if(!S.isHost){setupRoleButtons();ensureViewerDataConn()}
-    if(S.isHost){
-      broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
-      startHostPresenceAnnouncements();
-    }
-  });
-  peer.on('error',err=>{
-    if(NET.peer!==peer)return;
+function initAblyTransport(){
+  if(!canUsePeerTransport()){
+    setConnBadge('offline','Relay unavailable');
+    return;
+  }
+  if(NET.ably) return;
+  setConnBadge('warn', 'Connecting...');
 
-    if(S.isHost&&err&&err.type==='unavailable-id'){
-      if(NET.peer===peer)NET.peer=null;
-      NET.ready=false;
-      NET.connectingToHost=false;
-      setConnBadge('warn','Retrying host ID...');
-      try{peer.destroy()}catch(e){}
-      setTimeout(()=>{
-        if(!NET.peer)initPeerTransport();
-      },1200);
-      return;
-    }
-    NET.lastError=(err&&err.type)||err.message||'peer error';
-    setConnBadge('warn','Relay issue');
-    schedulePeerReconnect(NET.lastError);
+  const ably = new Ably.Realtime({
+    key: 'Ga_1Rw.SGk7BQ:CHJeB7zDcZ6YCewowiSgnaCcvfc65PJWLWT3IWhVmcI',
+    clientId: S.myName + '_' + Date.now()
   });
-  peer.on('disconnected',()=>{
-    if(NET.peer!==peer)return;
-    NET.ready=false;
-    CONN.dataConnected=false;
-    setConnBadge('warn','Relay disconnected');
+
+  NET.ably = ably;
+
+  ably.connection.on('connected', () => {
+    NET.ready = true;
+    NET.retries = 0;
+    setReconnectBanner(false);
+    setConnBadge('online', 'Connected');
+
+    const channelName = 'screendate-' + S.roomCode;
+    NET.channel = ably.channels.get(channelName);
+
+    NET.channel.subscribe(msg => {
+      try {
+        const data = JSON.parse(msg.data);
+        if(data.from === S.myName) return;
+        handleAblyMessage(data);
+      } catch(e) {}
+    });
+
+    NET.channel.attach(() => {
+      NET.dataConnected = true;
+      CONN.dataConnected = true;
+      NET.hasEverConnected = true;
+      if(MSG_QUEUE.length > 0) {
+        const queued = [...MSG_QUEUE];
+        MSG_QUEUE = [];
+        queued.forEach(d => broadcast(d));
+      }
+      if(!S.isHost) {
+        setupRoleButtons();
+        setTimeout(() => {
+          broadcast({type:'join', name:S.myName});
+        }, 500);
+      }
+      if(S.isHost) {
+        broadcast({type:'join', name:S.myName});
+        startHostPresenceAnnouncements();
+      }
+    });
+  });
+
+  ably.connection.on('disconnected', () => {
+    NET.ready = false;
+    NET.dataConnected = false;
+    CONN.dataConnected = false;
+    setConnBadge('warn', 'Disconnected');
     schedulePeerReconnect('disconnected');
   });
-  peer.on('close',()=>{
-    if(NET.peer!==peer)return;
 
-    NET.ready=false;
-    CONN.dataConnected=false;
-    NET.connectingToHost=false;
-    NET.watchRequestConn=null;
-    NET.dataConns=new Map();
-    NET.peer=null;
-    setConnBadge('offline','Relay closed');
+  ably.connection.on('failed', () => {
+    NET.ready = false;
+    NET.dataConnected = false;
+    CONN.dataConnected = false;
+    setConnBadge('offline', 'Connection failed');
+  });
 
-    schedulePeerReconnect('closed');
-  });
-  peer.on('connection',conn=>{
-    if(NET.peer!==peer)return;
-    registerPeerConn(conn);
-  });
-  peer.on('call',call=>{
-    if(NET.peer!==peer){try{call.close()}catch(e){};return}
-    if(S.isHost){
-      if(!SS.stream){call.close();return}
-      try{call.answer(SS.stream)}catch(e){call.close();return}
-      NET.currentCall=call;
-      call.on('close',()=>{
-        if(NET.currentCall===call)NET.currentCall=null;
-        CONN.streamConnected=false;
-        stopConnectionQualityMonitor();
-      });
-      return;
-    }
-    try{call.answer()}catch(e){call.close();return}
-    NET.currentCall=call;
-    call.on('stream',stream=>{
-      clearTimeout(NET.connectTimer);
-      NET.connectTimer=null;
-      bindScreenVideo(stream,false);
-      CONN.streamConnected=true;
-      CONN.streamRetries=0;
-      monitorConnectionQuality();
-      document.getElementById('remote-screen').style.display='none';
-      setSSStatus('👁 Watching '+(S.partnerName||'host')+'\'s screen','var(--violet)');
-      sysMsg('Screen share connected 🎉');
-      toast('Connected to screen share! 🖥️');
-    });
-    call.on('close',()=>{
-      if(NET.currentCall===call)NET.currentCall=null;
-      CONN.streamConnected=false;
-      stopConnectionQualityMonitor();
-      if(SS.role==='viewer'&&hasOpenDataConn())scheduleStreamReconnect();
-    });
+  ably.connection.on('closed', () => {
+    NET.ready = false;
+    NET.dataConnected = false;
+    CONN.dataConnected = false;
+    setConnBadge('offline', 'Closed');
   });
 }
-function initPeerTransport(){
-  if(!canUsePeerTransport())return;
-  if(NET.peer){
-    if(!NET.peer.destroyed)return;
-    NET.peer=null;
-  }
-  const desiredId=S.isHost?hostPeerId():undefined;
-  setConnBadge('warn','Relay connecting…');
-  try{
-    NET.peer=new Peer(desiredId,PEER_CFG);
-  }catch(e){
-    NET.lastError=e.message||'peer init failed';
-    setConnBadge('offline','Relay error');
+function handleAblyMessage(data) {
+  if(!data || !data.type) return;
+
+  if(data.type === 'webrtc_offer') {
+    handleWebRTCOffer(data);
     return;
   }
-  setupPeerEvents();
-}
-function registerPeerConn(conn){
-  if(!conn)return;
-  if(conn._registered)return;
-  conn._registered=true;
-  NET.dataConns.set(conn.peer,conn);
-  if(!S.isHost)NET.watchRequestConn=conn;
-  conn.on('open',()=>{
-    CONN.dataConnected=true;
-    NET.connectingToHost=false;
-    flushMsgQueue(conn);
-    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
-  });
-  conn.on('data',data=>handlePeerData(conn,data));
-  conn.on('error',()=>{
-    NET.connectingToHost=false;
-    if(NET.dataConns.get(conn.peer)===conn)NET.dataConns.delete(conn.peer);
-    if(NET.watchRequestConn===conn)NET.watchRequestConn=null;
-    CONN.dataConnected=hasOpenDataConn();
-  });
-  conn.on('close',()=>{
-    NET.connectingToHost=false;
-    if(NET.dataConns.get(conn.peer)===conn)NET.dataConns.delete(conn.peer);
-    if(NET.watchRequestConn===conn)NET.watchRequestConn=null;
-    CONN.dataConnected=hasOpenDataConn();
-  });
-}
-async function handlePeerData(conn,data){
-  if(!data)return;
-  if(data.type==='watch_request'){
-    if(!S.isHost)return;
-    const viewerId=data.viewerId||conn.peer;
-    if(!viewerId)return;
-    if(SS.stream&&SS.isSharing){
-      startPeerStreamToViewer(viewerId);
-    }else{
-      NET.pendingViewers.add(viewerId);
+  if(data.type === 'webrtc_answer') {
+    handleWebRTCAnswer(data);
+    return;
+  }
+  if(data.type === 'webrtc_ice') {
+    const candidate = data.payload && data.payload.candidate;
+    if(candidate && SS.pc) {
+      queueRemoteIceCandidate(candidate);
     }
     return;
   }
-  if(data.type==='webrtc_offer'){
-    if(S.isHost)return;
-    const sdp=data.payload&&data.payload.sdp;
-    if(!sdp)return;
-    SS.signalPeerId=conn.peer;
-    if(!SS.pc){await startWebRTC('viewer')}
-    try{
-      await SS.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  if(data.type === 'watch_request') {
+    if(!S.isHost) return;
+    if(SS.stream && SS.isSharing) {
+      startWebRTCOffer();
+    } else {
+      NET.pendingViewers.add(data.from);
+    }
+    return;
+  }
+
+  processSyncMessage(data);
+}
+async function handleWebRTCOffer(data) {
+  if(S.isHost) return;
+  const sdp = data.payload && data.payload.sdp;
+  if(!sdp) return;
+  if(!SS.pc) { await startWebRTC('viewer'); }
+  try {
+    await SS.pc.setRemoteDescription(
+      new RTCSessionDescription(sdp)
+    );
+    await flushRemoteIceCandidates();
+    const answer = await SS.pc.createAnswer();
+    await SS.pc.setLocalDescription(answer);
+    broadcast({
+      type: 'webrtc_answer',
+      payload: { sdp: answer }
+    });
+  } catch(e) {
+    toast('Connection error: ' + e.message);
+  }
+}
+async function handleWebRTCAnswer(data) {
+  if(!S.isHost || !SS.pc) return;
+  const sdp = data.payload && data.payload.sdp;
+  if(!sdp) return;
+  try {
+    if(SS.pc.signalingState === 'have-local-offer') {
+      await SS.pc.setRemoteDescription(
+        new RTCSessionDescription(sdp)
+      );
       await flushRemoteIceCandidates();
-      const answer=await SS.pc.createAnswer();
-      await SS.pc.setLocalDescription(answer);
-      sendSignalToPeer(conn.peer,{type:'webrtc_answer',payload:{sdp:answer}});
-    }catch(e){
-      toast('Connection error: '+e.message);
     }
-    return;
-  }
-  if(data.type==='webrtc_answer'){
-    if(!S.isHost||!SS.pc)return;
-    const sdp=data.payload&&data.payload.sdp;
-    if(!sdp)return;
-    SS.signalPeerId=conn.peer;
-    try{
-      if(SS.pc.signalingState==='have-local-offer'){
-        await SS.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        await flushRemoteIceCandidates();
-      }
-    }catch(e){}
-    return;
-  }
-  if(data.type==='webrtc_ice'){
-    const candidate=data.payload&&data.payload.candidate;
-    if(!candidate||!SS.pc)return;
-    queueRemoteIceCandidate(candidate);
-    return;
-  }
-  if(data.type){
-    processSyncMessage(data);
-  }
+  } catch(e) {}
 }
-function ensureViewerDataConn(){
-  if(S.isHost)return;
-  if(NET.connectingToHost)return;
-  if(!NET.peer||!NET.ready){
-    setTimeout(ensureViewerDataConn,1000);
-    return;
-  }
-  NET.connectingToHost=true;
-  const hostId=NET.hostPeerOverride||hostPeerId();
-  const existing=NET.dataConns.get(hostId);
-  if(existing&&existing.open){
-    NET.watchRequestConn=existing;
-    CONN.dataConnected=true;
-    NET.connectingToHost=false;
-    return;
-  }
-  if(existing&&!existing.open){
-    try{existing.close()}catch(e){}
-    NET.dataConns.delete(hostId);
-  }
-  setConnBadge('warn','Connecting to host...');
-  const conn=NET.peer.connect(hostId,{
-    reliable:true,
-    serialization:'json'
-  });
-  NET.dataConns.set(hostId,conn);
-  NET.watchRequestConn=conn;
-
-  let opened=false;
-  conn._registered=true;
-
-  conn.on('open',()=>{
-    opened=true;
-    NET.connectingToHost=false;
-    CONN.dataConnected=true;
-    NET.watchRequestConn=conn;
-    flushMsgQueue(conn);
-    setConnBadge('online','Connected to host');
-    broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
-    if(NET.hasEverConnected)sysMsg('✅ Reconnected!');
-    else sysMsg('✅ Connected to '+(S.partnerName||'host')+'!');
-    NET.hasEverConnected=true;
-    toast('Connected to host ✅');
-  });
-
-  conn.on('data',data=>handlePeerData(conn,data));
-
-  conn.on('error',err=>{
-    NET.connectingToHost=false;
-    CONN.dataConnected=false;
-    NET.dataConns.delete(hostId);
-    NET.watchRequestConn=null;
-    setConnBadge('warn','Retrying...');
-    setTimeout(ensureViewerDataConn,2000);
-  });
-
-  conn.on('close',()=>{
-    NET.connectingToHost=false;
-    CONN.dataConnected=false;
-    if(NET.dataConns.get(hostId)===conn){
-      NET.dataConns.delete(hostId);
-    }
-    if(NET.watchRequestConn===conn){
-      NET.watchRequestConn=null;
-    }
-    setConnBadge('warn','Disconnected');
-    sysMsg('⚠️ Connection lost. Reconnecting...');
-    setTimeout(ensureViewerDataConn,2000);
-  });
-
-  setTimeout(()=>{
-    if(!opened){
-      NET.connectingToHost=false;
-      CONN.dataConnected=false;
-      try{conn.close()}catch(e){}
-      NET.dataConns.delete(hostId);
-      NET.watchRequestConn=null;
-      setConnBadge('warn','Retrying connection...');
-      toast('Host not reachable yet. Retrying...');
-      setTimeout(ensureViewerDataConn,2500);
-    }
-  },5000);
-}
-function startPeerStreamToViewer(viewerId){
-  if(!SS.stream||!viewerId)return;
-  NET.pendingViewers.delete(viewerId);
-  SS.signalPeerId=viewerId;
-  startWebRTC('offerer',SS.stream,viewerId).catch(e=>toast('Connection error: '+e.message));
+async function startWebRTCOffer() {
+  await startWebRTC('offerer', SS.stream, null);
 }
 
 /* -- ROOM -- */
@@ -1525,14 +1365,14 @@ function initRoom(){
   initEmojiGrid();initMoodRow();renderSnacks();
   if(!canUsePeerTransport())setConnBadge('offline','Relay unavailable');
   setupRoleButtons();
-  initPeerTransport();
+  initAblyTransport();
   refreshShareAvailability();
   if(S.notes)document.getElementById('notes-area').value=S.notes;
   window.addEventListener('storage',onStore);
   setTimeout(()=>{
     const badge=document.getElementById('partner-badge');
     if(badge&&/^Waiting/i.test((badge.textContent||'').trim())){
-      broadcast({type:'join',name:S.myName,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+      broadcast({type:'join',name:S.myName});
     }
   },3000);
   sysMsg('Welcome to '+S.roomName+' 💖');
@@ -1547,7 +1387,16 @@ function initRoom(){
 
 /* -- SYNC -- */
 function broadcast(d){
-  const p={...d,from:S.myName,ts:Date.now(),id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)};
+  if(!NET.channel) {
+    MSG_QUEUE.push(d);
+    return;
+  }
+  const p={
+    ...d,
+    from:S.myName,
+    ts:Date.now(),
+    id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)
+  };
 
   // localStorage fallback for same-device
   const k='sd_m_'+S.roomCode;
@@ -1559,19 +1408,17 @@ function broadcast(d){
     }catch(e){}
   },5000);
 
-  // Send directly via data channels
-  let hasConn=false;
-  for(const conn of NET.dataConns.values()){
-    if(!conn)continue;
-    hasConn=true;
-    safeSend(conn,p);
-  }
-  if(!hasConn)MSG_QUEUE.push(p);
+  NET.channel.publish('msg', JSON.stringify(p), (err) => {
+    if(err) {
+      MSG_QUEUE.push(d);
+    }
+  });
 }
 function onStore(e){
   if(!e.key||!e.key.startsWith('sd_m_'+S.roomCode)||!e.newValue)return;
   const d=JSON.parse(e.newValue);
-  processSyncMessage(d);
+  if(d.from===S.myName)return;
+  handleAblyMessage(d);
 }
 function processSyncMessage(d){
   if(!d||d.from===S.myName)return;
@@ -1585,11 +1432,10 @@ function processSyncMessage(d){
   }
   if(d.type==='join'){
     S.partnerName=d.name;document.getElementById('partner-badge').textContent=d.name;
-    if(!S.isHost&&d.peerId)NET.hostPeerOverride=d.peerId;
     sysMsg(d.name+' joined 💫');
     if(S.isHost){
       stopHostPresenceAnnouncements();
-      broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing,peerId:NET.peer&&NET.peer.id?NET.peer.id:''});
+      broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing});
     }
     if(S.videoUrl)broadcast({type:'video',url:S.videoUrl});
   }else if(d.type==='welcome'){
@@ -1597,7 +1443,6 @@ function processSyncMessage(d){
       S.partnerName=d.hostName;
       document.getElementById('partner-badge').textContent=d.hostName;
     }
-    if(!S.isHost&&d.peerId)NET.hostPeerOverride=d.peerId;
     if(d.roomName){
       S.roomName=d.roomName;
       document.getElementById('rh-name').textContent='💞 '+S.roomName;
@@ -1636,7 +1481,7 @@ function sysMsg(t){
 function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 /* ----------------------------------
-   SCREEN SHARE (WebRTC via PeerJS data-channel signalling)
+   SCREEN SHARE (WebRTC via Ably signalling)
 ---------------------------------- */
 let SS={pc:null,stream:null,isSharing:false,role:null,signalPeerId:'',pendingRemoteCandidates:[]};
 
@@ -1645,21 +1490,6 @@ function resetPeerConnection(){
   SS.pc=null;
   SS.pendingRemoteCandidates=[];
   SS.signalPeerId='';
-}
-function sendSignalToPeer(peerId,msg){
-  if(!peerId)return false;
-  const conn=NET.dataConns.get(peerId);
-  if(!conn||!conn.open)return false;
-  try{conn.send(msg);return true}catch(e){return false}
-}
-function sendSignal(msg){
-  let sent=false;
-  for(const conn of NET.dataConns.values()){
-    if(conn&&conn.open){
-      try{conn.send(msg);sent=true}catch(e){}
-    }
-  }
-  return sent;
 }
 function queueRemoteIceCandidate(candidate){
   if(!candidate||!SS.pc)return;
@@ -1721,7 +1551,7 @@ async function toggleShare(){
     return;
   }
   try{
-    initPeerTransport();
+    initAblyTransport();
     const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:30},audio:true});
     if(!stream.getVideoTracks().length){
       toast('No video track was provided by screen sharing.');
@@ -1748,8 +1578,8 @@ async function toggleShare(){
     sysMsg('You started sharing your screen 🖥️');
     broadcast({type:'ss_start',name:S.myName});
     if(NET.pendingViewers.size){
-      const firstViewer=[...NET.pendingViewers][0];
-      if(firstViewer)startPeerStreamToViewer(firstViewer);
+      NET.pendingViewers.clear();
+      startWebRTCOffer().catch(e=>toast('Connection error: '+e.message));
     }
 
     // Handle stream end (user clicks browser's stop button)
@@ -1823,12 +1653,10 @@ async function startWebRTC(role,stream,targetPeerId){
 
   SS.pc.onicecandidate=e=>{
     if(!e.candidate)return;
-    const msg={type:'webrtc_ice',payload:{candidate:e.candidate.toJSON()}};
-    if(SS.signalPeerId){
-      sendSignalToPeer(SS.signalPeerId,msg);
-      return;
-    }
-    sendSignal(msg);
+    broadcast({
+      type:'webrtc_ice',
+      payload:{candidate:e.candidate.toJSON()}
+    });
   };
   SS.pc.onconnectionstatechange=()=>{
     const st=SS.pc&&SS.pc.connectionState;
@@ -1861,66 +1689,49 @@ async function startWebRTC(role,stream,targetPeerId){
 
   const offer=await SS.pc.createOffer();
   await SS.pc.setLocalDescription(offer);
-  const sent=SS.signalPeerId
-    ? sendSignalToPeer(SS.signalPeerId,{type:'webrtc_offer',payload:{sdp:offer}})
-    : sendSignal({type:'webrtc_offer',payload:{sdp:offer}});
-  if(!sent){
-    toast('Viewer is not connected yet. Ask them to tap Watch again.');
-  }
+  broadcast({
+    type:'webrtc_offer',
+    payload:{sdp:offer}
+  });
 }
 
 async function viewerJoin(autoRetry=false){
-  if(canUsePeerTransport()){
-    initPeerTransport();
-    ensureViewerDataConn();
-    if(!NET.peer||!NET.ready){
-      if(!autoRetry)toast('Connecting… try Watch again in a moment.');
-      return;
-    }
-    if(!autoRetry)CONN.streamRetries=0;
-    SS.role='viewer';
-    CONN.streamConnected=false;
-    document.getElementById('vph').style.display='none';
-    document.getElementById('remote-screen').style.display='flex';
-    const remoteText=document.getElementById('remote-screen-text');
-    if(remoteText)remoteText.textContent=autoRetry?'Reconnecting to stream...':'Connecting to screen share...';
-    document.getElementById('ss-btn').style.display='none';
-    setSSStatus(autoRetry?'Reconnecting to stream...':'Connecting to host screen...','var(--violet)');
-    document.getElementById('np').style.display='flex';
-    document.getElementById('np-text').textContent='👁 Watching '+(S.partnerName||'host')+'\'s screen';
-    if(!NET.watchRequestConn||!NET.watchRequestConn.open){
-      ensureViewerDataConn();
-    }
-    const sendReq=()=>{
-      flushMsgQueue(NET.watchRequestConn);
-      safeSend(NET.watchRequestConn,{type:'watch_request',viewerId:NET.peer.id,name:S.myName});
-    };
-    if(NET.watchRequestConn&&NET.watchRequestConn.open){sendReq()}
-    else if(NET.watchRequestConn){NET.watchRequestConn.on('open',sendReq)}
-    if(NET.watchRequestConn&&!NET.watchRequestConn._errorHandlerAttached){
-      NET.watchRequestConn._errorHandlerAttached=true;
-      NET.watchRequestConn.on('error',()=>{
-        if(autoRetry){scheduleStreamReconnect();return}
-        toast('Could not reach host yet. Try Watch again.');
-        document.getElementById('ss-btn').style.display='flex';
-        document.getElementById('remote-screen').style.display='none';
-        document.getElementById('vph').style.display='flex';
-        setupRoleButtons();
-      });
-    }
-    clearTimeout(NET.connectTimer);
-    NET.connectTimer=setTimeout(()=>{
-      if(autoRetry){scheduleStreamReconnect();return}
-      toast('Host stream not received yet. Ask host to restart sharing, then tap Watch again.',5500);
-      document.getElementById('ss-btn').style.display='flex';
-      document.getElementById('remote-screen').style.display='none';
-      document.getElementById('vph').style.display='flex';
-      setupRoleButtons();
-    },12000);
+  if(!NET.ready || !NET.channel) {
+    toast('Connecting... try Watch again in a moment.');
     return;
   }
+  if(!autoRetry) CONN.streamRetries = 0;
+  SS.role = 'viewer';
+  CONN.streamConnected = false;
 
-  toast('Relay unavailable. Refresh and try again.',4200);
+  document.getElementById('vph').style.display = 'none';
+  document.getElementById('remote-screen').style.display = 'flex';
+  const remoteText = document.getElementById('remote-screen-text');
+  if(remoteText) remoteText.textContent =
+    autoRetry ? 'Reconnecting...' : 'Connecting to screen share...';
+  document.getElementById('ss-btn').style.display = 'none';
+  setSSStatus('Connecting to host screen...', 'var(--violet)');
+  document.getElementById('np').style.display = 'flex';
+  document.getElementById('np-text').textContent =
+    '👁 Watching ' + (S.partnerName||'host') + '\'s screen';
+
+  await startWebRTC('viewer');
+
+  broadcast({
+    type: 'watch_request',
+    name: S.myName
+  });
+
+  clearTimeout(NET.connectTimer);
+  NET.connectTimer = setTimeout(() => {
+    if(CONN.streamConnected) return;
+    if(autoRetry) { scheduleStreamReconnect(); return; }
+    toast('Host stream not received. Ask host to restart sharing.',5500);
+    document.getElementById('ss-btn').style.display = 'flex';
+    document.getElementById('remote-screen').style.display = 'none';
+    document.getElementById('vph').style.display = 'flex';
+    setupRoleButtons();
+  }, 12000);
 }
 
 function incomingSsStart(name){
@@ -2072,12 +1883,28 @@ function doLeave(){
   clearTimeout(NET.connectTimer);
   NET.connectTimer=null;
   if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
-  if(NET.watchRequestConn){try{NET.watchRequestConn.close()}catch(e){}}
-  NET.dataConns.forEach(conn=>{try{conn.close()}catch(e){}});
-  NET.dataConns.clear();
-  if(NET.currentCall){try{NET.currentCall.close()}catch(e){}}
-  if(NET.peer){try{NET.peer.destroy()}catch(e){}}
-  NET={peer:null,ready:false,currentCall:null,lastError:'',pendingViewers:new Set(),watchRequestConn:null,connectTimer:null,dataConns:new Map(),reconnectTimer:null,retries:0,connectingToHost:false,hostAnnounceTimer:null,hasEverConnected:false,hostPeerOverride:'',peerOpenTime:0};
+  if(NET.ably){
+    try{NET.ably.close()}catch(e){}
+  }
+  NET = {
+    ably: null,
+    channel: null,
+    ready: false,
+    dataConnected: false,
+    connectingToHost: false,
+    hasEverConnected: false,
+    reconnectTimer: null,
+    retries: 0,
+    hostPeerOverride: '',
+    currentCall: null,
+    connectTimer: null,
+    pendingViewers: new Set(),
+    watchRequestConn: null,
+    dataConns: new Map(),
+    hostAnnounceTimer: null,
+    peerOpenTime: 0,
+    lastError: ''
+  };
   setConnBadge('offline','Relay offline');
   closeModal();showPage('landing');
 }
