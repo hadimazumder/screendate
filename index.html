@@ -1174,7 +1174,9 @@ function candidatesSafeFromStorage(rawRoom){
   }catch(e){}
   return '';
 }
-function hostPeerId(){return 'sdhost_'+(S.roomCode||'').toLowerCase()}
+function hostPeerId(){
+  return 'sdhost'+(S.roomCode||'').toLowerCase()
+}
 function canUsePeerTransport(){
   return typeof window.Peer==='function';
 }
