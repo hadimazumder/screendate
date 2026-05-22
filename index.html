@@ -1303,12 +1303,9 @@ function handleAblyMessage(data) {
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
     if(SS.stream && SS.isSharing) {
-      // Wait briefly for the viewer RTCPeerConnection to be ready.
-      setTimeout(() => {
-        startWebRTCOffer();
-      }, 1000);
+      startWebRTCOffer();
     } else {
-      NET.pendingViewers.add(data.from);
+      NET.pendingViewers.add(data.from || 'viewer');
     }
     return;
   }
@@ -1320,45 +1317,66 @@ async function handleWebRTCOffer(data) {
   const sdp = data.payload && data.payload.sdp;
   if(!sdp) return;
 
-  if(!SS.pc) {
-    SS.pc = new RTCPeerConnection(RTC_CONFIG);
-    SS.role = 'viewer';
-    SS.pendingRemoteCandidates = [];
+  sysMsg('Received stream offer, connecting...');
 
-    SS.pc.onicecandidate = e => {
-      if(!e.candidate) return;
-      broadcast({
-        type: 'webrtc_ice',
-        payload: { candidate: e.candidate.toJSON() }
-      });
-    };
+  resetPeerConnection();
+  SS.pc = new RTCPeerConnection(RTC_CONFIG);
+  SS.role = 'viewer';
+  SS.pendingRemoteCandidates = [];
 
-    SS.pc.ontrack = e => {
-      if(!e.streams || !e.streams[0]) return;
-      bindScreenVideo(e.streams[0], false);
+  SS.pc.onicecandidate = e => {
+    if(!e.candidate) return;
+    broadcast({
+      type: 'webrtc_ice',
+      payload: { candidate: e.candidate.toJSON() }
+    });
+  };
+
+  SS.pc.ontrack = e => {
+    const stream = e.streams && e.streams[0];
+    if(!stream) return;
+
+    sysMsg('Stream received! Loading video...');
+    bindScreenVideo(stream, false);
+    CONN.streamConnected = true;
+    CONN.streamRetries = 0;
+    monitorConnectionQuality();
+    clearTimeout(NET.connectTimer);
+
+    document.getElementById('remote-screen').style.display = 'none';
+    setSSStatus("👁 Watching " + (S.partnerName||'host') + "'s screen", 'var(--violet)');
+    sysMsg('Screen share connected 🎉');
+    toast("You're now watching! 🖥️");
+  };
+
+  SS.pc.onconnectionstatechange = () => {
+    const st = SS.pc && SS.pc.connectionState;
+    if(st === 'connected') {
       CONN.streamConnected = true;
-      CONN.streamRetries = 0;
       monitorConnectionQuality();
-      clearTimeout(NET.connectTimer);
-      document.getElementById('remote-screen').style.display = 'none';
-      setSSStatus("👁 Watching " + (S.partnerName||'host') + "'s screen", 'var(--violet)');
-      sysMsg('Screen share connected 🎉');
-      toast("You're now watching! 🖥️");
-    };
-  }
+    }
+    if(st === 'disconnected' || st === 'failed') {
+      CONN.streamConnected = false;
+      stopConnectionQualityMonitor();
+      if(hasOpenDataConn()) scheduleStreamReconnect();
+    }
+  };
 
   try {
-    await SS.pc.setRemoteDescription(
-      new RTCSessionDescription(sdp)
-    );
+    await SS.pc.setRemoteDescription(new RTCSessionDescription(sdp));
     await flushRemoteIceCandidates();
+
     const answer = await SS.pc.createAnswer();
     await SS.pc.setLocalDescription(answer);
+
     broadcast({
       type: 'webrtc_answer',
-      payload: { sdp: answer }
+      payload: { sdp: SS.pc.localDescription }
     });
+
+    sysMsg('Sent answer, waiting for video...');
   } catch(e) {
+    sysMsg('Connection error: ' + e.message);
     toast('Connection error: ' + e.message);
   }
 }
@@ -1376,15 +1394,18 @@ async function handleWebRTCAnswer(data) {
   } catch(e) {}
 }
 async function startWebRTCOffer() {
-  if(!SS.stream) return;
+  if(!SS.stream) {
+    toast('No stream available');
+    return;
+  }
 
   resetPeerConnection();
   SS.pc = new RTCPeerConnection(RTC_CONFIG);
   SS.role = 'offerer';
   SS.pendingRemoteCandidates = [];
 
-  SS.stream.getTracks().forEach(t => {
-    SS.pc.addTrack(t, SS.stream);
+  SS.stream.getTracks().forEach(track => {
+    SS.pc.addTrack(track, SS.stream);
   });
 
   SS.pc.onicecandidate = e => {
@@ -1400,6 +1421,7 @@ async function startWebRTCOffer() {
     if(st === 'connected') {
       CONN.streamConnected = true;
       monitorConnectionQuality();
+      sysMsg('Viewer connected to stream ✅');
     }
     if(st === 'disconnected' || st === 'failed') {
       CONN.streamConnected = false;
@@ -1408,15 +1430,21 @@ async function startWebRTCOffer() {
   };
 
   try {
-    const offer = await SS.pc.createOffer();
+    const offer = await SS.pc.createOffer({
+      offerToReceiveAudio: false,
+      offerToReceiveVideo: false
+    });
     await SS.pc.setLocalDescription(offer);
 
     broadcast({
       type: 'webrtc_offer',
-      payload: { sdp: offer }
+      payload: { sdp: SS.pc.localDescription }
     });
+
+    sysMsg('Sent stream offer to viewer...');
   } catch(e) {
     toast('Screen share error: ' + e.message);
+    sysMsg('Stream offer failed: ' + e.message);
   }
 }
 
@@ -1649,9 +1677,7 @@ async function toggleShare(){
     sysMsg('You started sharing your screen 🖥️');
     broadcast({type:'ss_start',name:S.myName});
     if(NET.pendingViewers.size > 0){
-      setTimeout(() => {
-        startWebRTCOffer();
-      }, 1000);
+      startWebRTCOffer();
     }
 
     // Handle stream end (user clicks browser's stop button)
@@ -1694,78 +1720,23 @@ function setSSStatus(text,color){
 const RTC_CONFIG={
   iceServers:[
     {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun1.l.google.com:19302'},
+    {urls:'stun:stun2.l.google.com:19302'},
+    {urls:'stun:stun3.l.google.com:19302'},
+    {urls:'stun:stun4.l.google.com:19302'},
     {
-      urls:'turn:openrelay.metered.ca:80',
-      username:'openrelayproject',
-      credential:'openrelayproject'
+      urls:'turn:relay1.expressturn.com:3478',
+      username:'efTGAO9ZLRSM59S0PK',
+      credential:'EpGBCEGzFk1MWQJR'
     },
     {
-      urls:'turn:openrelay.metered.ca:443',
-      username:'openrelayproject',
-      credential:'openrelayproject'
-    },
-    {
-      urls:'turn:openrelay.metered.ca:443?transport=tcp',
-      username:'openrelayproject',
-      credential:'openrelayproject'
+      urls:[
+        'turn:turn.anyfirewall.com:443?transport=tcp'
+      ],
+      username:'webrtc',
+      credential:'webrtc'
     }
   ]
 };
-
-async function startWebRTC(role,stream,targetPeerId){
-  resetPeerConnection();
-  SS.pc=new RTCPeerConnection(RTC_CONFIG);
-  SS.role=role;
-  SS.signalPeerId=targetPeerId||'';
-
-  if(role==='offerer'&&stream){
-    stream.getTracks().forEach(t=>SS.pc.addTrack(t,stream));
-  }
-
-  SS.pc.onicecandidate=e=>{
-    if(!e.candidate)return;
-    broadcast({
-      type:'webrtc_ice',
-      payload:{candidate:e.candidate.toJSON()}
-    });
-  };
-  SS.pc.onconnectionstatechange=()=>{
-    const st=SS.pc&&SS.pc.connectionState;
-    if(st==='connected'){
-      CONN.streamConnected=true;
-      CONN.streamRetries=0;
-      monitorConnectionQuality();
-      return;
-    }
-    if(st==='disconnected'||st==='failed'||st==='closed'){
-      CONN.streamConnected=false;
-      stopConnectionQualityMonitor();
-      if(SS.role==='viewer'&&hasOpenDataConn())scheduleStreamReconnect();
-    }
-  };
-
-  if(role==='viewer'){
-    SS.pc.ontrack=e=>{
-      bindScreenVideo(e.streams[0],false);
-      CONN.streamConnected=true;
-      CONN.streamRetries=0;
-      monitorConnectionQuality();
-      document.getElementById('remote-screen').style.display='none';
-      setSSStatus('👁 Watching '+S.partnerName+'\'s screen','var(--violet)');
-      sysMsg('Screen share connected 🎉');
-      toast('You\'re now watching the screen share! 🖥️');
-    };
-    return;
-  }
-
-  const offer=await SS.pc.createOffer();
-  await SS.pc.setLocalDescription(offer);
-  broadcast({
-    type:'webrtc_offer',
-    payload:{sdp:offer}
-  });
-}
 
 async function viewerJoin(autoRetry=false){
   if(!NET.ready || !NET.channel) {
@@ -1774,6 +1745,8 @@ async function viewerJoin(autoRetry=false){
   }
   if(!autoRetry) CONN.streamRetries = 0;
   if(!autoRetry) SS._retried = false;
+
+  resetPeerConnection();
   SS.role = 'viewer';
   CONN.streamConnected = false;
 
@@ -1789,53 +1762,6 @@ async function viewerJoin(autoRetry=false){
   document.getElementById('np-text').textContent =
     '👁 Watching ' + (S.partnerName||'host') + "'s screen";
 
-  // IMPORTANT: Reset and setup PC first
-  resetPeerConnection();
-  SS.pc = new RTCPeerConnection(RTC_CONFIG);
-  SS.role = 'viewer';
-  SS.pendingRemoteCandidates = [];
-
-  // Set up ICE candidate handler
-  SS.pc.onicecandidate = e => {
-    if(!e.candidate) return;
-    broadcast({
-      type: 'webrtc_ice',
-      payload: { candidate: e.candidate.toJSON() }
-    });
-  };
-
-  // Set up track handler to receive video
-  SS.pc.ontrack = e => {
-    if(!e.streams || !e.streams[0]) return;
-    bindScreenVideo(e.streams[0], false);
-    CONN.streamConnected = true;
-    CONN.streamRetries = 0;
-    monitorConnectionQuality();
-    clearTimeout(NET.connectTimer);
-    document.getElementById('remote-screen').style.display = 'none';
-    setSSStatus("👁 Watching " + (S.partnerName||'host') + "'s screen", 'var(--violet)');
-    sysMsg('Screen share connected 🎉');
-    toast("You're now watching the screen share! 🖥️");
-  };
-
-  SS.pc.onconnectionstatechange = () => {
-    const st = SS.pc && SS.pc.connectionState;
-    if(st === 'connected') {
-      CONN.streamConnected = true;
-      CONN.streamRetries = 0;
-      monitorConnectionQuality();
-      return;
-    }
-    if(st === 'disconnected' || st === 'failed' || st === 'closed') {
-      CONN.streamConnected = false;
-      stopConnectionQualityMonitor();
-      if(SS.role === 'viewer' && hasOpenDataConn()) {
-        scheduleStreamReconnect();
-      }
-    }
-  };
-
-  // NOW send watch request AFTER PC is ready
   broadcast({
     type: 'watch_request',
     name: S.myName
@@ -1852,16 +1778,16 @@ async function viewerJoin(autoRetry=false){
       broadcast({ type: 'watch_request', name: S.myName });
       NET.connectTimer = setTimeout(() => {
         if(CONN.streamConnected) return;
-        toast('Could not connect to stream. Ask host to restart sharing.', 5500);
+        toast('Could not connect. Ask host to restart sharing.', 5500);
         document.getElementById('ss-btn').style.display = 'flex';
         document.getElementById('remote-screen').style.display = 'none';
         document.getElementById('vph').style.display = 'flex';
         setupRoleButtons();
-      }, 8000);
+      }, 10000);
       return;
     }
 
-    toast('Could not connect to stream. Ask host to restart sharing.', 5500);
+    toast('Could not connect. Ask host to restart sharing.', 5500);
     document.getElementById('ss-btn').style.display = 'flex';
     document.getElementById('remote-screen').style.display = 'none';
     document.getElementById('vph').style.display = 'flex';
