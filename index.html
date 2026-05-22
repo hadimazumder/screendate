@@ -903,6 +903,9 @@ const CONN={
 };
 let MSG_QUEUE=[];
 const SEEN_SYNC=new Set();
+const SEEN_SIGNAL_IDS=new Set();
+const WEBRTC_SIGNAL_TYPES=new Set(['watch_request','webrtc_offer','webrtc_answer','webrtc_ice']);
+const LOCAL_STORAGE_SYNC_TYPES=new Set(['chat','join','welcome','ss_start','ss_stop','reaction','mood','hearts']);
 const QS=new URLSearchParams(location.search);
 function setConnBadge(state,text){
   const el=document.getElementById('conn-badge');
@@ -1052,7 +1055,7 @@ async function logViewerReconnectDebug(reason,pc){
   }catch(e){
     debug.selectedCandidatePair='stats unavailable: '+e.message;
   }
-  console.info('[ScreenDate WebRTC] reconnect failed debug',debug);
+  console.info('[SD-RTC] reconnect failed debug',debug);
 }
 async function failViewerStreamConnection(reason){
   const pc=SS.pc;
@@ -1080,13 +1083,14 @@ async function failViewerStreamConnection(reason){
   if(remote)remote.style.display='none';
   const vph=document.getElementById('vph');
   if(vph)vph.style.display='flex';
-  setSSStatus('Connection failed. Ask host to restart sharing or check TURN server.','var(--pink)');
+  setSSStatus('Connection failed. Try Watch again or ask host to restart sharing.','var(--pink)');
 }
 function scheduleStreamReconnect(){
   if(SS.role!=='viewer')return;
   if(!hasOpenDataConn())return;
   CONN.streamConnected=false;
   stopConnectionQualityMonitor();
+  if(CONN.streamReconnectTimer)return;
   if(CONN.streamRetries>=3){
     failViewerStreamConnection('max stream reconnect retries reached');
     return;
@@ -1366,6 +1370,14 @@ function initAblyTransport(){
 }
 function handleAblyMessage(data) {
   if(!data || !data.type) return;
+  if(data.id){
+    if(SEEN_SIGNAL_IDS.has(data.id))return;
+    SEEN_SIGNAL_IDS.add(data.id);
+    if(SEEN_SIGNAL_IDS.size>800){
+      const first=SEEN_SIGNAL_IDS.values().next().value;
+      SEEN_SIGNAL_IDS.delete(first);
+    }
+  }
 
   if(data.type === 'webrtc_offer') {
     handleWebRTCOffer(data);
@@ -1378,15 +1390,26 @@ function handleAblyMessage(data) {
   if(data.type === 'webrtc_ice') {
     const candidate = data.payload && data.payload.candidate;
     const sessionId = getWebRTCSessionId(data);
-    webRTCLog('ICE candidate received',{sessionId:sessionId||SS.sessionId||'pending',activeSessionId:SS.sessionId});
+    webRTCLog('ICE candidate received',{sessionId:sessionId||'missing',activeSessionId:SS.sessionId});
+    if(!isActiveWebRTCSession(sessionId)){
+      webRTCLog('ICE candidate ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
+      return;
+    }
     if(candidate) queueRemoteIceCandidate(candidate, sessionId);
     return;
   }
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
+    const sessionId = getWebRTCSessionId(data);
+    webRTCLog('watch_request received',{sessionId,from:data.from});
+    if(!sessionId)return;
     NET.pendingViewers.add(data.from || 'viewer');
     if(SS.stream && SS.isSharing) {
-      startWebRTCOffer(getWebRTCSessionId(data));
+      if((SS.offerInProgress||SS.offeredSessionId===sessionId)&&SS.sessionId===sessionId){
+        webRTCLog('duplicate watch_request ignored',{sessionId,offerInProgress:SS.offerInProgress});
+        return;
+      }
+      startWebRTCOffer(sessionId);
     }
     return;
   }
@@ -1399,7 +1422,7 @@ async function handleWebRTCOffer(data) {
   if(!sdp) return;
   const sessionId = getWebRTCSessionId(data)||createWebRTCSessionId();
   webRTCLog('offer received',{sessionId});
-  if(SS.role==='viewer'&&SS.sessionId&&sessionId!==SS.sessionId){
+  if(!isActiveWebRTCSession(sessionId)){
     webRTCLog('offer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
     return;
   }
@@ -1418,12 +1441,19 @@ async function handleWebRTCOffer(data) {
   SS.pc.ontrack = e => {
     const stream = e.streams && e.streams[0];
     if(!stream) return;
+    webRTCLog('ontrack fired',{sessionId});
     bindScreenVideo(stream, false);
     CONN.streamConnected = true;
     CONN.streamRetries = 0;
     monitorConnectionQuality();
     clearTimeout(NET.connectTimer);
+    if(CONN.streamReconnectTimer){
+      clearTimeout(CONN.streamReconnectTimer);
+      CONN.streamReconnectTimer=null;
+    }
     document.getElementById('remote-screen').style.display = 'none';
+    document.getElementById('np-text').textContent =
+      '👁 Watching ' + (S.partnerName||'host') + "'s screen";
     setSSStatus("👁 Watching " + (S.partnerName||'host') + "'s screen", 'var(--violet)');
     sysMsg('Screen share connected 🎉');
     toast("You're now watching! 🖥️");
@@ -1435,6 +1465,11 @@ async function handleWebRTCOffer(data) {
     if(st === 'connected') {
       CONN.streamConnected = true;
       monitorConnectionQuality();
+      if(CONN.streamReconnectTimer){
+        clearTimeout(CONN.streamReconnectTimer);
+        CONN.streamReconnectTimer=null;
+      }
+      setTimeout(()=>logSelectedCandidatePair(sessionId,pc),500);
     }
     if(st === 'disconnected' || st === 'failed') {
       CONN.streamConnected = false;
@@ -1446,6 +1481,7 @@ async function handleWebRTCOffer(data) {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     await flushRemoteIceCandidates(sessionId);
     const answer = await pc.createAnswer();
+    webRTCLog('answer created',{sessionId});
     await pc.setLocalDescription(answer);
     webRTCLog('answer sent',{sessionId});
     broadcast({ type:'webrtc_answer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
@@ -1459,7 +1495,7 @@ async function handleWebRTCAnswer(data) {
   if(!S.isHost || !SS.pc) return;
   const sdp = data.payload && data.payload.sdp;
   if(!sdp) return;
-  if(sessionId&&SS.sessionId&&sessionId!==SS.sessionId){
+  if(!isActiveWebRTCSession(sessionId)){
     webRTCLog('answer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
     return;
   }
@@ -1475,6 +1511,12 @@ async function handleWebRTCAnswer(data) {
 async function startWebRTCOffer(requestedSessionId) {
   if(!SS.stream) return;
   const sessionId = requestedSessionId||createWebRTCSessionId();
+  if((SS.offerInProgress||SS.offeredSessionId===sessionId)&&SS.sessionId===sessionId){
+    webRTCLog('offer creation skipped for duplicate session',{sessionId,offerInProgress:SS.offerInProgress});
+    return;
+  }
+  SS.offerInProgress=true;
+  SS.offeredSessionId=sessionId;
   resetPeerConnection(sessionId);
   SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'offerer';
@@ -1495,6 +1537,7 @@ async function startWebRTCOffer(requestedSessionId) {
     if(st === 'connected') {
       CONN.streamConnected = true;
       monitorConnectionQuality();
+      setTimeout(()=>logSelectedCandidatePair(sessionId,pc),500);
     }
     if(st === 'disconnected' || st === 'failed') {
       CONN.streamConnected = false;
@@ -1503,11 +1546,14 @@ async function startWebRTCOffer(requestedSessionId) {
   };
   try {
     const offer = await pc.createOffer();
+    webRTCLog('offer created',{sessionId});
     await pc.setLocalDescription(offer);
     webRTCLog('offer sent',{sessionId});
     broadcast({ type:'webrtc_offer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
   } catch(e) {
     toast('Screen share error: ' + e.message);
+  } finally {
+    if(SS.sessionId===sessionId)SS.offerInProgress=false;
   }
 }
 
@@ -1560,15 +1606,18 @@ function broadcast(d){
     id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)
   };
 
-  // localStorage fallback for same-device
-  const k='sd_m_'+S.roomCode;
-  localStorage.setItem(k,JSON.stringify(p));
-  setTimeout(()=>{
-    try{
-      if(localStorage.getItem(k)===JSON.stringify(p))
-        localStorage.removeItem(k)
-    }catch(e){}
-  },5000);
+  // localStorage fallback is only for lightweight UI sync.
+  // WebRTC signalling must be Ably-only to avoid duplicate offers/ICE.
+  if(LOCAL_STORAGE_SYNC_TYPES.has(p.type)&&!WEBRTC_SIGNAL_TYPES.has(p.type)){
+    const k='sd_m_'+S.roomCode;
+    localStorage.setItem(k,JSON.stringify(p));
+    setTimeout(()=>{
+      try{
+        if(localStorage.getItem(k)===JSON.stringify(p))
+          localStorage.removeItem(k)
+      }catch(e){}
+    },5000);
+  }
 
   NET.channel.publish('msg', JSON.stringify(p), (err) => {
     if(err) {
@@ -1645,21 +1694,24 @@ function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 /* ----------------------------------
    SCREEN SHARE (WebRTC via Ably signalling)
 ---------------------------------- */
-let SS={pc:null,stream:null,isSharing:false,role:null,signalPeerId:'',pendingRemoteCandidates:[],pendingIceBySession:{},sessionId:'',_retried:false};
+let SS={pc:null,stream:null,isSharing:false,role:null,signalPeerId:'',pendingRemoteCandidates:[],pendingIceBySession:{},sessionId:'',offerInProgress:false,offeredSessionId:'',_retried:false};
 
 function webRTCLog(message,details){
-  if(details!==undefined)console.log('[ScreenDate WebRTC] '+message,details);
-  else console.log('[ScreenDate WebRTC] '+message);
+  if(details!==undefined)console.log('[SD-RTC] '+message,details);
+  else console.log('[SD-RTC] '+message);
 }
 function webRTCWarn(message,details){
-  if(details!==undefined)console.warn('[ScreenDate WebRTC] '+message,details);
-  else console.warn('[ScreenDate WebRTC] '+message);
+  if(details!==undefined)console.warn('[SD-RTC] '+message,details);
+  else console.warn('[SD-RTC] '+message);
 }
 function createWebRTCSessionId(){
-  return 'ss_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10);
+  return 'rtc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
 }
 function getWebRTCSessionId(data){
   return (data&&(data.sessionId||(data.payload&&data.payload.sessionId)))||'';
+}
+function isActiveWebRTCSession(sessionId){
+  return !!(sessionId&&SS.sessionId&&sessionId===SS.sessionId);
 }
 function ensureRemoteIceQueue(sessionId){
   const sid=sessionId||SS.sessionId||'pending';
@@ -1687,6 +1739,14 @@ function attachPeerConnectionStateLogs(pc,label,sessionId){
   pc.oniceconnectionstatechange=()=>logPeerConnectionState(label+' iceConnectionState',sessionId,pc);
   pc.onicegatheringstatechange=()=>logPeerConnectionState(label+' iceGatheringState',sessionId,pc);
 }
+async function logSelectedCandidatePair(sessionId,pc){
+  try{
+    const pair=await getSelectedCandidatePairDebug(pc);
+    webRTCLog('selected candidate pair',{sessionId,pair});
+  }catch(e){
+    webRTCWarn('selected candidate pair unavailable',{sessionId,error:e.message});
+  }
+}
 function resetPeerConnection(keepSessionId){
   if(SS.pc){
     logPeerConnectionState('pc closing',SS.sessionId,SS.pc);
@@ -1698,6 +1758,8 @@ function resetPeerConnection(keepSessionId){
   else{
     SS.sessionId='';
     SS.pendingRemoteCandidates=[];
+    SS.offerInProgress=false;
+    SS.offeredSessionId='';
   }
 }
 function queueRemoteIceCandidate(candidate,sessionId){
@@ -1853,47 +1915,35 @@ function setSSStatus(text,color){
 }
 
 /* WebRTC core */
-const FORCE_TURN_RELAY = false;
+const FORCE_TURN_RELAY = true;
 const GOOGLE_STUN_FALLBACK = [
   'stun:stun.l.google.com:19302',
   'stun:stun1.l.google.com:19302',
   'stun:stun2.l.google.com:19302',
   'stun:stun3.l.google.com:19302'
 ];
-const TURN_ICE_SERVERS = [
-  /*
-    Add real TURN credentials here from Metered, Twilio, Xirsys,
-    ExpressTURN, or your own coturn server.
-
-    TODO: For production, prefer short-lived TURN credentials from a backend
-    token endpoint instead of hardcoding long-lived TURN secrets in this file.
-
-    Example:
-    {
-      urls: [
-        'turn:turn.example.com:3478?transport=udp',
-        'turn:turn.example.com:3478?transport=tcp',
-        'turns:turn.example.com:443?transport=tcp'
-      ],
-      username: 'REPLACE_WITH_TURN_USERNAME',
-      credential: 'REPLACE_WITH_TURN_PASSWORD'
-    }
-  */
-];
+const TURN_CONFIG = {
+  urls: [
+    'turn:YOUR_TURN_DOMAIN_OR_IP:3478?transport=udp',
+    'turn:YOUR_TURN_DOMAIN_OR_IP:3478?transport=tcp',
+    'turns:YOUR_TURN_DOMAIN_OR_IP:5349?transport=tcp'
+  ],
+  username: 'YOUR_TURN_USERNAME',
+  credential: 'YOUR_TURN_PASSWORD'
+};
 function getRTCConfig(){
-  const turnServers=TURN_ICE_SERVERS.filter(server=>{
-    const urls=Array.isArray(server.urls)?server.urls:[server.urls];
-    return urls.filter(Boolean).length&&server.username&&server.credential;
-  });
+  const hasTurnConfig=TURN_CONFIG.urls.length&&TURN_CONFIG.username&&TURN_CONFIG.credential;
   const config={
-    iceServers:[
-      ...turnServers,
-      {urls:GOOGLE_STUN_FALLBACK}
-    ]
+    iceServers:hasTurnConfig?[TURN_CONFIG]:[]
   };
-  if(FORCE_TURN_RELAY)config.iceTransportPolicy='relay';
+  if(FORCE_TURN_RELAY){
+    config.iceTransportPolicy='relay';
+  }else{
+    config.iceServers.push({urls:GOOGLE_STUN_FALLBACK});
+  }
   return config;
 }
+console.log('[SD-RTC] RTC config loaded', getRTCConfig());
 
 async function viewerJoin(autoRetry=false) {
   if(!NET.ready || !NET.channel) {
@@ -1917,7 +1967,7 @@ async function viewerJoin(autoRetry=false) {
   setSSStatus('Connecting to host screen...', 'var(--violet)');
   document.getElementById('np').style.display = 'flex';
   document.getElementById('np-text').textContent = 
-    '👁 Watching ' + (S.partnerName||'host') + "'s screen";
+    'Connecting to host screen...';
   
   webRTCLog('watch_request sent',{sessionId});
   broadcast({ type: 'watch_request', name: S.myName, sessionId: sessionId, payload: { sessionId: sessionId } });
