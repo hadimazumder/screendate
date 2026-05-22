@@ -872,6 +872,20 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;o
 <script>
 /* -- STATE -- */
 let S={myName:'',partnerName:'',roomName:'',roomCode:'',isHost:false,messages:[],notes:'',snacks:[],myMood:'',partnerMood:'',videoUrl:''};
+function createClientId(){
+  if(window.crypto&&typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();
+  return 'client_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2);
+}
+let CLIENT_ID='';
+try{
+  CLIENT_ID=sessionStorage.getItem('sd_client_id')||'';
+  if(!CLIENT_ID){
+    CLIENT_ID=createClientId();
+    sessionStorage.setItem('sd_client_id',CLIENT_ID);
+  }
+}catch(e){
+  CLIENT_ID=createClientId();
+}
 const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
 let NET = {
   ably: null,
@@ -1266,9 +1280,9 @@ function setupRoleButtons(){
   }
   btn.textContent='👁 Watch';
   btn.onclick=viewerJoin;
-  btn.disabled=false;
-  btn.classList.remove('disabled');
-  setSSStatus('Waiting for host stream — tap Watch','var(--text3)');
+  btn.disabled=true;
+  btn.classList.add('disabled');
+  setSSStatus('Waiting for host','var(--text3)');
 }
 function manualRetryConnection(){
   toast('Retrying connection...');
@@ -1306,10 +1320,15 @@ function initAblyTransport(){
   }
   if(NET.ably) return;
   setConnBadge('warn', 'Connecting...');
+  const channelName = 'screendate-' + S.roomCode;
 
   const ably = new Ably.Realtime({
-    key: 'Ga_1Rw.SGk7BQ:CHJeB7zDcZ6YCewowiSgnaCcvfc65PJWLWT3IWhVmcI',
-    clientId: S.myName + '_' + Date.now()
+    authUrl: '/api/ably-token',
+    authMethod: 'GET',
+    // Backend must issue a token scoped only to this room channel
+    // (for example: capability { [channelName]: ['publish','subscribe'] }).
+    authParams: { roomCode: S.roomCode, channel: channelName, clientId: CLIENT_ID },
+    clientId: CLIENT_ID
   });
 
   NET.ably = ably;
@@ -1320,13 +1339,11 @@ function initAblyTransport(){
     setReconnectBanner(false);
     setConnBadge('online', 'Connected');
 
-    const channelName = 'screendate-' + S.roomCode;
     NET.channel = ably.channels.get(channelName);
 
     NET.channel.subscribe(msg => {
       try {
         const data = JSON.parse(msg.data);
-        if(data.from === S.myName) return;
         handleAblyMessage(data);
       } catch(e) {}
     });
@@ -1376,7 +1393,7 @@ function initAblyTransport(){
   });
 }
 function handleAblyMessage(data) {
-  if(!data || !data.type) return;
+  if(!data) return;
   if(data.id){
     if(SEEN_SIGNAL_IDS.has(data.id))return;
     SEEN_SIGNAL_IDS.add(data.id);
@@ -1385,6 +1402,8 @@ function handleAblyMessage(data) {
       SEEN_SIGNAL_IDS.delete(first);
     }
   }
+  if(data.fromId&&data.fromId===CLIENT_ID)return;
+  if(!data.type) return;
 
   if(data.type === 'webrtc_offer') {
     handleWebRTCOffer(data);
@@ -1408,9 +1427,9 @@ function handleAblyMessage(data) {
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
     const sessionId = getWebRTCSessionId(data);
-    webRTCLog('watch_request received',{sessionId,from:data.from});
+    webRTCLog('watch_request received',{sessionId,fromId:data.fromId,fromName:data.fromName||data.from});
     if(!sessionId)return;
-    NET.pendingViewers.add(data.from || 'viewer');
+    NET.pendingViewers.add(data.fromId || data.fromName || data.from || 'viewer');
     if(SS.stream && SS.isSharing) {
       if((SS.offerInProgress||SS.offeredSessionId===sessionId)&&SS.sessionId===sessionId){
         webRTCLog('duplicate watch_request ignored',{sessionId,offerInProgress:SS.offerInProgress});
@@ -1434,6 +1453,7 @@ async function handleWebRTCOffer(data) {
     return;
   }
   resetPeerConnection(sessionId);
+  await ensureTurnCredentials();
   SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'viewer';
   setActiveWebRTCSession(sessionId);
@@ -1529,6 +1549,7 @@ async function startWebRTCOffer(requestedSessionId) {
   SS.offerInProgress=true;
   SS.offeredSessionId=sessionId;
   resetPeerConnection(sessionId);
+  await ensureTurnCredentials();
   SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'offerer';
   setActiveWebRTCSession(sessionId);
@@ -1610,6 +1631,8 @@ function broadcast(d){
   }
   const p={
     ...d,
+    fromId:CLIENT_ID,
+    fromName:S.myName,
     from:S.myName,
     ts:Date.now(),
     id:'m_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36)
@@ -1637,11 +1660,11 @@ function broadcast(d){
 function onStore(e){
   if(!e.key||!e.key.startsWith('sd_m_'+S.roomCode)||!e.newValue)return;
   const d=JSON.parse(e.newValue);
-  if(d.from===S.myName)return;
   handleAblyMessage(d);
 }
 function processSyncMessage(d){
-  if(!d||d.from===S.myName)return;
+  if(!d)return;
+  if(d.fromId&&d.fromId===CLIENT_ID)return;
   if(d.id){
     if(SEEN_SYNC.has(d.id))return;
     SEEN_SYNC.add(d.id);
@@ -1651,8 +1674,9 @@ function processSyncMessage(d){
     }
   }
   if(d.type==='join'){
-    S.partnerName=d.name;document.getElementById('partner-badge').textContent=d.name;
-    sysMsg(d.name+' joined 💫');
+    const name=safeText(d.name||d.fromName||'Partner');
+    S.partnerName=name;document.getElementById('partner-badge').textContent=name;
+    sysMsg(name+' joined 💫');
     if(S.isHost){
       stopHostPresenceAnnouncements();
       broadcast({type:'welcome',hostName:S.myName,roomName:S.roomName,isSharing:SS.isSharing});
@@ -1660,22 +1684,22 @@ function processSyncMessage(d){
     if(S.videoUrl)broadcast({type:'video',url:S.videoUrl});
   }else if(d.type==='welcome'){
     if(d.hostName){
-      S.partnerName=d.hostName;
-      document.getElementById('partner-badge').textContent=d.hostName;
+      S.partnerName=safeText(d.hostName);
+      document.getElementById('partner-badge').textContent=S.partnerName;
     }
     if(d.roomName){
-      S.roomName=d.roomName;
+      S.roomName=safeText(d.roomName);
       document.getElementById('rh-name').textContent='💞 '+S.roomName;
     }
     sysMsg('Connected to '+(S.partnerName||'host')+' ✅');
     if(d.isSharing)incomingSsStart(S.partnerName||'Host');
-  }else if(d.type==='chat'){addMsg(d.name,d.text,false)}
-  else if(d.type==='reaction'){floatEmoji(d.emoji);sysMsg(d.name+' reacted '+d.emoji)}
-  else if(d.type==='ss_start'){incomingSsStart(d.name)}
-  else if(d.type==='ss_stop'){incomingSsStop(d.name)}
-  else if(d.type==='mood'){S.partnerMood=d.mood;refreshMood()}
-  else if(d.type==='hearts'){doHearts();toast(d.name+' sent a heart shower 💕')}
-  else if(d.type==='leave'){sysMsg(d.name+' left 💔');S.partnerName='';document.getElementById('partner-badge').textContent='Waiting…'}
+  }else if(d.type==='chat'){addMsg(d.name||d.fromName,d.text,false)}
+  else if(d.type==='reaction'){floatEmoji(d.emoji);sysMsg(safeText(d.name||d.fromName||'Partner')+' reacted '+safeText(d.emoji))}
+  else if(d.type==='ss_start'){incomingSsStart(d.name||d.fromName)}
+  else if(d.type==='ss_stop'){incomingSsStop(d.name||d.fromName)}
+  else if(d.type==='mood'){S.partnerMood=safeText(d.mood);refreshMood()}
+  else if(d.type==='hearts'){doHearts();toast(safeText(d.name||d.fromName||'Partner')+' sent a heart shower 💕')}
+  else if(d.type==='leave'){sysMsg(safeText(d.name||d.fromName||'Partner')+' left 💔');S.partnerName='';document.getElementById('partner-badge').textContent='Waiting…'}
 }
 
 /* -- CHAT -- */
@@ -1687,18 +1711,50 @@ function sendMsg(){
 }
 function addMsg(name,text,isMe){
   const msgs=document.getElementById('messages');
-  const isE=/^\p{Emoji}+$/u.test(text)&&text.length<=4;
+  const safeName=safeText(name||'?');
+  const safeMessage=safeText(text);
+  const isE=/^\p{Emoji}+$/u.test(safeMessage)&&safeMessage.length<=4;
   const time=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   const div=document.createElement('div');div.className='msg'+(isMe?' me':'');
-  div.innerHTML=`<div class="mav">${(name||'?')[0].toUpperCase()}</div><div class="minn">${!isMe?`<div class="mname">${name}</div>`:''}<div class="mbub"${isE?' style="font-size:1.75rem;background:transparent;border:none;padding:.15rem .3rem"':''}>${esc(text)}</div><div class="mtime">${time}</div></div>`;
+  const avatar=document.createElement('div');
+  avatar.className='mav';
+  avatar.textContent=(safeName||'?')[0].toUpperCase();
+  const inner=document.createElement('div');
+  inner.className='minn';
+  if(!isMe){
+    const nameEl=document.createElement('div');
+    nameEl.className='mname';
+    nameEl.textContent=safeName;
+    inner.appendChild(nameEl);
+  }
+  const bubble=document.createElement('div');
+  bubble.className='mbub';
+  if(isE){
+    bubble.style.fontSize='1.75rem';
+    bubble.style.background='transparent';
+    bubble.style.border='none';
+    bubble.style.padding='.15rem .3rem';
+  }
+  bubble.textContent=safeMessage;
+  const timeEl=document.createElement('div');
+  timeEl.className='mtime';
+  timeEl.textContent=time;
+  inner.appendChild(bubble);
+  inner.appendChild(timeEl);
+  div.appendChild(avatar);
+  div.appendChild(inner);
   msgs.appendChild(div);msgs.scrollTop=msgs.scrollHeight;
 }
 function sysMsg(t){
   const msgs=document.getElementById('messages');
-  const d=document.createElement('div');d.className='msys';d.innerHTML=`<span>${t}</span>`;
+  const d=document.createElement('div');d.className='msys';
+  const span=document.createElement('span');
+  span.textContent=safeText(t);
+  d.appendChild(span);
   msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
 }
-function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function safeText(t){return t==null?'':String(t)}
+function esc(t){return safeText(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 /* ----------------------------------
    SCREEN SHARE (WebRTC via Ably signalling)
@@ -1971,27 +2027,51 @@ function setSSStatus(text,color){
 
 /* WebRTC core */
 const FORCE_TURN_RELAY = false;
+const TURN_CREDENTIALS_URL = '/api/turn-credentials';
 const GOOGLE_STUN_FALLBACK = [
   'stun:stun.l.google.com:19302',
   'stun:stun1.l.google.com:19302',
   'stun:stun2.l.google.com:19302',
   'stun:stun3.l.google.com:19302'
 ];
-const TURN_CONFIG = {
-  urls: [],
-  username: '',
-  credential: ''
-};
-function getRTCConfig(){
-  const hasTurnConfig=TURN_CONFIG.urls.length&&TURN_CONFIG.username&&TURN_CONFIG.credential;
-  const config={
-    iceServers:hasTurnConfig?[TURN_CONFIG]:[]
-  };
-  if(FORCE_TURN_RELAY){
-    config.iceTransportPolicy='relay';
-  }else{
-    config.iceServers.push({urls:GOOGLE_STUN_FALLBACK});
+let TURN_ICE_SERVERS=[];
+let TURN_CREDENTIALS_PROMISE=null;
+function normalizeTurnIceServers(data){
+  // /api/turn-credentials should return TURN URLs for UDP, TCP, and TLS, e.g.
+  // { urls:['turn:turn.example.com:3478?transport=udp','turn:turn.example.com:3478?transport=tcp','turns:turn.example.com:443?transport=tcp'], username:'...', credential:'...' }
+  const raw=Array.isArray(data)?data:(data&&Array.isArray(data.iceServers)?data.iceServers:(data?[data]:[]));
+  return raw.filter(server=>server&&server.urls).map(server=>({
+    urls:Array.isArray(server.urls)?server.urls:[server.urls],
+    username:server.username||server.user||'',
+    credential:server.credential||server.password||server.token||''
+  })).filter(server=>server.urls.length&&server.username&&server.credential);
+}
+async function ensureTurnCredentials(){
+  if(TURN_ICE_SERVERS.length)return TURN_ICE_SERVERS;
+  if(!TURN_CREDENTIALS_PROMISE){
+    TURN_CREDENTIALS_PROMISE=fetch(TURN_CREDENTIALS_URL,{cache:'no-store'})
+      .then(r=>r.ok?r.json():Promise.reject(new Error('TURN credentials HTTP '+r.status)))
+      .then(data=>{
+        TURN_ICE_SERVERS=normalizeTurnIceServers(data);
+        console.log('[SD-RTC] TURN credentials loaded',{count:TURN_ICE_SERVERS.length});
+        return TURN_ICE_SERVERS;
+      })
+      .catch(e=>{
+        console.warn('[SD-RTC] TURN credentials unavailable',e.message);
+        TURN_ICE_SERVERS=[];
+        return TURN_ICE_SERVERS;
+      });
   }
+  return TURN_CREDENTIALS_PROMISE;
+}
+function getRTCConfig(){
+  const config={
+    iceServers:[
+      ...TURN_ICE_SERVERS,
+      {urls:GOOGLE_STUN_FALLBACK}
+    ]
+  };
+  if(FORCE_TURN_RELAY)config.iceTransportPolicy='relay';
   return config;
 }
 console.log('[SD-RTC] RTC config loaded', getRTCConfig());
@@ -2044,13 +2124,14 @@ async function viewerJoin(autoRetry=false) {
 }
 
 function incomingSsStart(name){
-  sysMsg(name+' started sharing their screen 🖥️');
+  const displayName=safeText(name||S.partnerName||'Host');
+  sysMsg(displayName+' started sharing their screen 🖥️');
   document.getElementById('np').style.display='flex';
-  document.getElementById('np-text').textContent='📡 '+name+' is sharing screen';
-  toast(name+' started sharing their screen! 🖥️',3500);
+  document.getElementById('np-text').textContent='📡 '+displayName+' is sharing screen';
+  toast(displayName+' started sharing their screen! 🖥️',3500);
   // Show watch button
   const watchBtn=document.getElementById('ss-btn');
-  setSSStatus('📡 '+name+' is sharing — click Watch','var(--pink)');
+  setSSStatus('📡 '+displayName+' is sharing — click Watch','var(--pink)');
   watchBtn.textContent='👁 Watch';
   watchBtn.onclick=viewerJoin;
   watchBtn.disabled=false;
@@ -2059,7 +2140,8 @@ function incomingSsStart(name){
 }
 
 function incomingSsStop(name){
-  sysMsg(name+' stopped sharing 🛑');
+  const displayName=safeText(name||S.partnerName||'Host');
+  sysMsg(displayName+' stopped sharing 🛑');
   resetPeerConnection();
   SS.role=null;
   CONN.streamConnected=false;
@@ -2072,14 +2154,24 @@ function incomingSsStop(name){
   if(remoteText)remoteText.textContent='Connecting to screen share...';
   document.getElementById('vph').style.display='flex';
   document.getElementById('np').style.display='none';
-  setSSStatus('No screen shared yet','var(--text3)');
   const shareBtn=document.getElementById('ss-btn');
-  shareBtn.textContent='🖥️ Start Sharing';
-  shareBtn.onclick=toggleShare;
   shareBtn.style.display='flex';
-  refreshShareAvailability();
   document.getElementById('ss-stop-btn').style.display='none';
-  toast(name+' stopped sharing 🛑');
+  if(S.isHost){
+    shareBtn.textContent='🖥️ Start Sharing';
+    shareBtn.onclick=toggleShare;
+    shareBtn.disabled=false;
+    shareBtn.classList.remove('disabled');
+    setSSStatus('No screen shared yet','var(--text3)');
+    refreshShareAvailability();
+  }else{
+    shareBtn.textContent='👁 Watch';
+    shareBtn.onclick=viewerJoin;
+    shareBtn.disabled=true;
+    shareBtn.classList.add('disabled');
+    setSSStatus('Waiting for host','var(--text3)');
+  }
+  toast(displayName+' stopped sharing 🛑');
 }
 
 function toggleFS(){
@@ -2116,10 +2208,22 @@ function initMoodRow(){
 }
 function refreshMood(){
   const d=document.getElementById('mood-display');
-  const pts=[];
-  if(S.myMood)pts.push(`<span style="color:var(--violet)">You</span>: ${S.myMood}`);
-  if(S.partnerMood)pts.push(`<span style="color:var(--pink)">${S.partnerName||'Partner'}</span>: ${S.partnerMood}`);
-  d.innerHTML=pts.length?pts.join(' &nbsp;·&nbsp; '):'No mood set yet…';
+  d.textContent='';
+  const parts=[];
+  if(S.myMood)parts.push({label:'You',color:'var(--violet)',mood:S.myMood});
+  if(S.partnerMood)parts.push({label:S.partnerName||'Partner',color:'var(--pink)',mood:S.partnerMood});
+  if(!parts.length){
+    d.textContent='No mood set yet…';
+    return;
+  }
+  parts.forEach((part,i)=>{
+    if(i)d.appendChild(document.createTextNode(' \u00a0·\u00a0 '));
+    const label=document.createElement('span');
+    label.style.color=part.color;
+    label.textContent=safeText(part.label);
+    d.appendChild(label);
+    d.appendChild(document.createTextNode(': '+safeText(part.mood)));
+  });
 }
 function floatEmoji(e){
   const el=document.createElement('div');el.className='fe';el.textContent=e;
@@ -2163,7 +2267,14 @@ function renderSkList(){
   const l=document.getElementById('snack-list');l.innerHTML='';
   S.snacks.forEach((s,i)=>{
     const d=document.createElement('div');d.className='ski'+(s.c?' checked':'');
-    d.innerHTML=`<input type="checkbox" ${s.c?'checked':''} onchange="togSk(${i})"/><span>${esc(s.t)}</span>`;
+    const cb=document.createElement('input');
+    cb.type='checkbox';
+    cb.checked=!!s.c;
+    cb.onchange=()=>togSk(i);
+    const label=document.createElement('span');
+    label.textContent=safeText(s.t);
+    d.appendChild(cb);
+    d.appendChild(label);
     l.appendChild(d);
   });
 }
