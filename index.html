@@ -1295,6 +1295,10 @@ function handleAblyMessage(data) {
   }
   if(data.type === 'webrtc_ice') {
     const candidate = data.payload && data.payload.candidate;
+    // Only accept ICE candidates meant for our role
+    const target = data.payload && data.payload.target;
+    const myRole = S.isHost ? 'host' : 'viewer';
+    if(target && target !== myRole) return;
     if(candidate && SS.pc) {
       queueRemoteIceCandidate(candidate);
     }
@@ -1302,10 +1306,10 @@ function handleAblyMessage(data) {
   }
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
+    NET.pendingViewers.add(data.from || 'viewer');
     if(SS.stream && SS.isSharing) {
-      startWebRTCOffer();
-    } else {
-      NET.pendingViewers.add(data.from || 'viewer');
+      // Small delay to let any previous PC cleanup finish
+      setTimeout(() => startWebRTCOffer(), 300);
     }
     return;
   }
@@ -1319,22 +1323,30 @@ async function handleWebRTCOffer(data) {
 
   sysMsg('Received stream offer, connecting...');
 
+  // Show connecting UI immediately
+  document.getElementById('vph').style.display = 'none';
+  document.getElementById('remote-screen').style.display = 'flex';
+  const remoteText = document.getElementById('remote-screen-text');
+  if(remoteText) remoteText.textContent = 'Connecting to stream...';
+  document.getElementById('ss-btn').style.display = 'none';
+
   resetPeerConnection();
-  SS.pc = new RTCPeerConnection(RTC_CONFIG);
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  SS.pc = pc;
   SS.role = 'viewer';
   SS.pendingRemoteCandidates = [];
 
-  SS.pc.onicecandidate = e => {
+  pc.onicecandidate = e => {
     if(!e.candidate) return;
     broadcast({
       type: 'webrtc_ice',
-      payload: { candidate: e.candidate.toJSON() }
+      payload: { candidate: e.candidate.toJSON(), target: 'host' }
     });
   };
 
-  SS.pc.ontrack = e => {
-    const stream = e.streams && e.streams[0];
-    if(!stream) return;
+  pc.ontrack = e => {
+    // Fallback: if e.streams is empty, wrap e.track in a new MediaStream
+    const stream = (e.streams && e.streams[0]) || new MediaStream([e.track]);
 
     sysMsg('Stream received! Loading video...');
     bindScreenVideo(stream, false);
@@ -1349,8 +1361,9 @@ async function handleWebRTCOffer(data) {
     toast("You're now watching! 🖥️");
   };
 
-  SS.pc.onconnectionstatechange = () => {
-    const st = SS.pc && SS.pc.connectionState;
+  pc.onconnectionstatechange = () => {
+    if(SS.pc !== pc) return; // stale PC guard
+    const st = pc.connectionState;
     if(st === 'connected') {
       CONN.streamConnected = true;
       monitorConnectionQuality();
@@ -1362,16 +1375,25 @@ async function handleWebRTCOffer(data) {
     }
   };
 
+  pc.oniceconnectionstatechange = () => {
+    if(SS.pc !== pc) return;
+    const st = pc.iceConnectionState;
+    if(st === 'failed') {
+      sysMsg('ICE connection failed, will retry...');
+      if(hasOpenDataConn()) scheduleStreamReconnect();
+    }
+  };
+
   try {
-    await SS.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     await flushRemoteIceCandidates();
 
-    const answer = await SS.pc.createAnswer();
-    await SS.pc.setLocalDescription(answer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
 
     broadcast({
       type: 'webrtc_answer',
-      payload: { sdp: SS.pc.localDescription }
+      payload: { sdp: pc.localDescription }
     });
 
     sysMsg('Sent answer, waiting for video...');
@@ -1412,7 +1434,7 @@ async function startWebRTCOffer() {
     if(!e.candidate) return;
     broadcast({
       type: 'webrtc_ice',
-      payload: { candidate: e.candidate.toJSON() }
+      payload: { candidate: e.candidate.toJSON(), target: 'viewer' }
     });
   };
 
@@ -1426,6 +1448,14 @@ async function startWebRTCOffer() {
     if(st === 'disconnected' || st === 'failed') {
       CONN.streamConnected = false;
       stopConnectionQualityMonitor();
+    }
+  };
+
+  SS.pc.oniceconnectionstatechange = () => {
+    const st = SS.pc && SS.pc.iceConnectionState;
+    if(st === 'failed') {
+      sysMsg('ICE connection failed, attempting restart...');
+      try { SS.pc.restartIce(); } catch(e) {}
     }
   };
 
@@ -1591,7 +1621,13 @@ function resetPeerConnection(){
   SS.signalPeerId='';
 }
 function queueRemoteIceCandidate(candidate){
-  if(!candidate||!SS.pc)return;
+  if(!candidate)return;
+  if(!SS.pc){
+    // PC not ready yet - queue for later
+    if(!SS.pendingRemoteCandidates) SS.pendingRemoteCandidates=[];
+    SS.pendingRemoteCandidates.push(candidate);
+    return;
+  }
   if(SS.pc.remoteDescription&&SS.pc.remoteDescription.type){
     SS.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(()=>{});
     return;
@@ -1676,9 +1712,10 @@ async function toggleShare(){
     document.getElementById('np-text').textContent='📡 '+S.myName+' is sharing screen';
     sysMsg('You started sharing your screen 🖥️');
     broadcast({type:'ss_start',name:S.myName});
-    if(NET.pendingViewers.size > 0){
-      startWebRTCOffer();
-    }
+    // Send offer after a short delay to allow viewer to process ss_start first
+    setTimeout(() => {
+      if(SS.stream && SS.isSharing) startWebRTCOffer();
+    }, 1500);
 
     // Handle stream end (user clicks browser's stop button)
     stream.getVideoTracks()[0].addEventListener('ended',()=>stopShare());
@@ -1724,18 +1761,25 @@ const RTC_CONFIG={
     {urls:'stun:stun3.l.google.com:19302'},
     {urls:'stun:stun4.l.google.com:19302'},
     {
-      urls:'turn:relay1.expressturn.com:3478',
-      username:'efTGAO9ZLRSM59S0PK',
-      credential:'EpGBCEGzFk1MWQJR'
+      urls:'stun:openrelay.metered.ca:80'
     },
     {
-      urls:[
-        'turn:turn.anyfirewall.com:443?transport=tcp'
-      ],
-      username:'webrtc',
-      credential:'webrtc'
+      urls:'turn:openrelay.metered.ca:80',
+      username:'openrelayproject',
+      credential:'openrelayproject'
+    },
+    {
+      urls:'turn:openrelay.metered.ca:443',
+      username:'openrelayproject',
+      credential:'openrelayproject'
+    },
+    {
+      urls:'turn:openrelay.metered.ca:443?transport=tcp',
+      username:'openrelayproject',
+      credential:'openrelayproject'
     }
-  ]
+  ],
+  iceCandidatePoolSize: 4
 };
 
 async function viewerJoin(autoRetry=false){
@@ -1808,6 +1852,12 @@ function incomingSsStart(name){
   watchBtn.disabled=false;
   watchBtn.classList.remove('disabled');
   watchBtn.style.display='flex';
+  // Auto-join as viewer — send watch_request so host sends us the offer
+  if(!S.isHost && NET.ready && NET.channel) {
+    setTimeout(() => {
+      viewerJoin();
+    }, 800);
+  }
 }
 
 function incomingSsStop(name){
@@ -1980,6 +2030,7 @@ function toast(msg,dur=2800){
 /* -- BOOT -- */
 showPage('landing');
 </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
 
