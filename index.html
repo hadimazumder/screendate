@@ -897,6 +897,7 @@ const CONN={
   dataConnected:false,
   streamConnected:false,
   streamRetries:0,
+  streamReconnectTimer:null,
   qualityInterval:null,
   reconnectBanner:null
 };
@@ -1002,13 +1003,92 @@ function monitorConnectionQuality(){
   sampleConnectionQuality();
   CONN.qualityInterval=setInterval(sampleConnectionQuality,3000);
 }
+function summarizeIceCandidateStats(candidate){
+  if(!candidate)return null;
+  return {
+    type:candidate.candidateType,
+    protocol:candidate.protocol,
+    address:candidate.address||candidate.ip||'',
+    port:candidate.port,
+    relayProtocol:candidate.relayProtocol||'',
+    url:candidate.url||''
+  };
+}
+async function getSelectedCandidatePairDebug(pc){
+  if(!pc||typeof pc.getStats!=='function')return null;
+  const stats=await pc.getStats();
+  let pair=null;
+  stats.forEach(report=>{
+    if(report.type!=='candidate-pair')return;
+    const selected=report.selected||report.nominated||report.state==='succeeded';
+    if(selected&&(!pair||report.selected))pair=report;
+  });
+  if(!pair)return null;
+  const local=pair.localCandidateId?stats.get(pair.localCandidateId):null;
+  const remote=pair.remoteCandidateId?stats.get(pair.remoteCandidateId):null;
+  return {
+    id:pair.id,
+    state:pair.state,
+    nominated:!!pair.nominated,
+    selected:!!pair.selected,
+    currentRoundTripTime:pair.currentRoundTripTime,
+    availableOutgoingBitrate:pair.availableOutgoingBitrate,
+    local:summarizeIceCandidateStats(local),
+    remote:summarizeIceCandidateStats(remote)
+  };
+}
+async function logViewerReconnectDebug(reason,pc){
+  const target=pc||SS.pc;
+  const debug={
+    reason,
+    sessionId:SS.sessionId,
+    connectionState:target?target.connectionState:'no-peer-connection',
+    iceConnectionState:target?target.iceConnectionState:'no-peer-connection',
+    iceGatheringState:target?target.iceGatheringState:'no-peer-connection',
+    selectedCandidatePair:null
+  };
+  try{
+    debug.selectedCandidatePair=await getSelectedCandidatePairDebug(target);
+  }catch(e){
+    debug.selectedCandidatePair='stats unavailable: '+e.message;
+  }
+  console.info('[ScreenDate WebRTC] reconnect failed debug',debug);
+}
+async function failViewerStreamConnection(reason){
+  const pc=SS.pc;
+  clearTimeout(NET.connectTimer);
+  NET.connectTimer=null;
+  if(CONN.streamReconnectTimer){
+    clearTimeout(CONN.streamReconnectTimer);
+    CONN.streamReconnectTimer=null;
+  }
+  CONN.streamConnected=false;
+  CONN.streamRetries=0;
+  stopConnectionQualityMonitor();
+  await logViewerReconnectDebug(reason,pc);
+  resetPeerConnection();
+  SS.role=null;
+  const btn=document.getElementById('ss-btn');
+  if(btn){
+    btn.textContent='👁 Watch';
+    btn.onclick=viewerJoin;
+    btn.disabled=false;
+    btn.classList.remove('disabled');
+    btn.style.display='flex';
+  }
+  const remote=document.getElementById('remote-screen');
+  if(remote)remote.style.display='none';
+  const vph=document.getElementById('vph');
+  if(vph)vph.style.display='flex';
+  setSSStatus('Connection failed. Ask host to restart sharing or check TURN server.','var(--pink)');
+}
 function scheduleStreamReconnect(){
   if(SS.role!=='viewer')return;
   if(!hasOpenDataConn())return;
   CONN.streamConnected=false;
   stopConnectionQualityMonitor();
   if(CONN.streamRetries>=3){
-    toast('Could not reconnect. Ask host to restart sharing.');
+    failViewerStreamConnection('max stream reconnect retries reached');
     return;
   }
   CONN.streamRetries+=1;
@@ -1018,7 +1098,9 @@ function scheduleStreamReconnect(){
   if(remote)remote.style.display='flex';
   if(remoteText)remoteText.textContent='Reconnecting to stream...';
   setSSStatus('Reconnecting to stream...','var(--gold)');
-  setTimeout(()=>{
+  if(CONN.streamReconnectTimer)clearTimeout(CONN.streamReconnectTimer);
+  CONN.streamReconnectTimer=setTimeout(()=>{
+    CONN.streamReconnectTimer=null;
     if(SS.role!=='viewer')return;
     if(!hasOpenDataConn())return;
     if(CONN.streamRetries>3)return;
@@ -1295,21 +1377,16 @@ function handleAblyMessage(data) {
   }
   if(data.type === 'webrtc_ice') {
     const candidate = data.payload && data.payload.candidate;
-    // Only accept ICE candidates meant for our role
-    const target = data.payload && data.payload.target;
-    const myRole = S.isHost ? 'host' : 'viewer';
-    if(target && target !== myRole) return;
-    if(candidate && SS.pc) {
-      queueRemoteIceCandidate(candidate);
-    }
+    const sessionId = getWebRTCSessionId(data);
+    webRTCLog('ICE candidate received',{sessionId:sessionId||SS.sessionId||'pending',activeSessionId:SS.sessionId});
+    if(candidate) queueRemoteIceCandidate(candidate, sessionId);
     return;
   }
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
     NET.pendingViewers.add(data.from || 'viewer');
     if(SS.stream && SS.isSharing) {
-      // Small delay to let any previous PC cleanup finish
-      setTimeout(() => startWebRTCOffer(), 300);
+      startWebRTCOffer(getWebRTCSessionId(data));
     }
     return;
   }
@@ -1320,49 +1397,40 @@ async function handleWebRTCOffer(data) {
   if(S.isHost) return;
   const sdp = data.payload && data.payload.sdp;
   if(!sdp) return;
-
-  sysMsg('Received stream offer, connecting...');
-
-  // Show connecting UI immediately
-  document.getElementById('vph').style.display = 'none';
-  document.getElementById('remote-screen').style.display = 'flex';
-  const remoteText = document.getElementById('remote-screen-text');
-  if(remoteText) remoteText.textContent = 'Connecting to stream...';
-  document.getElementById('ss-btn').style.display = 'none';
-
-  resetPeerConnection();
-  const pc = new RTCPeerConnection(RTC_CONFIG);
-  SS.pc = pc;
+  const sessionId = getWebRTCSessionId(data)||createWebRTCSessionId();
+  webRTCLog('offer received',{sessionId});
+  if(SS.role==='viewer'&&SS.sessionId&&sessionId!==SS.sessionId){
+    webRTCLog('offer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
+    return;
+  }
+  resetPeerConnection(sessionId);
+  SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'viewer';
-  SS.pendingRemoteCandidates = [];
-
-  pc.onicecandidate = e => {
+  setActiveWebRTCSession(sessionId);
+  const pc = SS.pc;
+  attachPeerConnectionStateLogs(pc,'viewer pc',sessionId);
+  logPeerConnectionState('viewer pc created',sessionId,pc);
+  SS.pc.onicecandidate = e => {
     if(!e.candidate) return;
-    broadcast({
-      type: 'webrtc_ice',
-      payload: { candidate: e.candidate.toJSON(), target: 'host' }
-    });
+    webRTCLog('ICE candidate sent',{sessionId});
+    broadcast({ type:'webrtc_ice', sessionId: sessionId, payload:{ sessionId: sessionId, candidate: e.candidate.toJSON() }});
   };
-
-  pc.ontrack = e => {
-    // Fallback: if e.streams is empty, wrap e.track in a new MediaStream
-    const stream = (e.streams && e.streams[0]) || new MediaStream([e.track]);
-
-    sysMsg('Stream received! Loading video...');
+  SS.pc.ontrack = e => {
+    const stream = e.streams && e.streams[0];
+    if(!stream) return;
     bindScreenVideo(stream, false);
     CONN.streamConnected = true;
     CONN.streamRetries = 0;
     monitorConnectionQuality();
     clearTimeout(NET.connectTimer);
-
     document.getElementById('remote-screen').style.display = 'none';
     setSSStatus("👁 Watching " + (S.partnerName||'host') + "'s screen", 'var(--violet)');
     sysMsg('Screen share connected 🎉');
     toast("You're now watching! 🖥️");
   };
-
-  pc.onconnectionstatechange = () => {
-    if(SS.pc !== pc) return; // stale PC guard
+  SS.pc.onconnectionstatechange = () => {
+    logPeerConnectionState('viewer pc connectionState',sessionId,pc);
+    if(SS.pc!==pc||SS.sessionId!==sessionId)return;
     const st = pc.connectionState;
     if(st === 'connected') {
       CONN.streamConnected = true;
@@ -1374,107 +1442,72 @@ async function handleWebRTCOffer(data) {
       if(hasOpenDataConn()) scheduleStreamReconnect();
     }
   };
-
-  pc.oniceconnectionstatechange = () => {
-    if(SS.pc !== pc) return;
-    const st = pc.iceConnectionState;
-    if(st === 'failed') {
-      sysMsg('ICE connection failed, will retry...');
-      if(hasOpenDataConn()) scheduleStreamReconnect();
-    }
-  };
-
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    await flushRemoteIceCandidates();
-
+    await flushRemoteIceCandidates(sessionId);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-
-    broadcast({
-      type: 'webrtc_answer',
-      payload: { sdp: pc.localDescription }
-    });
-
-    sysMsg('Sent answer, waiting for video...');
+    webRTCLog('answer sent',{sessionId});
+    broadcast({ type:'webrtc_answer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
   } catch(e) {
-    sysMsg('Connection error: ' + e.message);
     toast('Connection error: ' + e.message);
   }
 }
 async function handleWebRTCAnswer(data) {
+  const sessionId = getWebRTCSessionId(data);
+  webRTCLog('answer received',{sessionId,activeSessionId:SS.sessionId});
   if(!S.isHost || !SS.pc) return;
   const sdp = data.payload && data.payload.sdp;
   if(!sdp) return;
+  if(sessionId&&SS.sessionId&&sessionId!==SS.sessionId){
+    webRTCLog('answer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
+    return;
+  }
   try {
     if(SS.pc.signalingState === 'have-local-offer') {
       await SS.pc.setRemoteDescription(
         new RTCSessionDescription(sdp)
       );
-      await flushRemoteIceCandidates();
+      await flushRemoteIceCandidates(sessionId||SS.sessionId);
     }
   } catch(e) {}
 }
-async function startWebRTCOffer() {
-  if(!SS.stream) {
-    toast('No stream available');
-    return;
-  }
-
-  resetPeerConnection();
-  SS.pc = new RTCPeerConnection(RTC_CONFIG);
+async function startWebRTCOffer(requestedSessionId) {
+  if(!SS.stream) return;
+  const sessionId = requestedSessionId||createWebRTCSessionId();
+  resetPeerConnection(sessionId);
+  SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'offerer';
-  SS.pendingRemoteCandidates = [];
-
-  SS.stream.getTracks().forEach(track => {
-    SS.pc.addTrack(track, SS.stream);
-  });
-
-  SS.pc.onicecandidate = e => {
+  setActiveWebRTCSession(sessionId);
+  const pc = SS.pc;
+  attachPeerConnectionStateLogs(pc,'host pc',sessionId);
+  logPeerConnectionState('host pc created',sessionId,pc);
+  SS.stream.getTracks().forEach(t => pc.addTrack(t, SS.stream));
+  pc.onicecandidate = e => {
     if(!e.candidate) return;
-    broadcast({
-      type: 'webrtc_ice',
-      payload: { candidate: e.candidate.toJSON(), target: 'viewer' }
-    });
+    webRTCLog('ICE candidate sent',{sessionId});
+    broadcast({ type:'webrtc_ice', sessionId: sessionId, payload:{ sessionId: sessionId, candidate: e.candidate.toJSON() }});
   };
-
-  SS.pc.onconnectionstatechange = () => {
-    const st = SS.pc && SS.pc.connectionState;
+  pc.onconnectionstatechange = () => {
+    logPeerConnectionState('host pc connectionState',sessionId,pc);
+    if(SS.pc!==pc||SS.sessionId!==sessionId)return;
+    const st = pc.connectionState;
     if(st === 'connected') {
       CONN.streamConnected = true;
       monitorConnectionQuality();
-      sysMsg('Viewer connected to stream ✅');
     }
     if(st === 'disconnected' || st === 'failed') {
       CONN.streamConnected = false;
       stopConnectionQualityMonitor();
     }
   };
-
-  SS.pc.oniceconnectionstatechange = () => {
-    const st = SS.pc && SS.pc.iceConnectionState;
-    if(st === 'failed') {
-      sysMsg('ICE connection failed, attempting restart...');
-      try { SS.pc.restartIce(); } catch(e) {}
-    }
-  };
-
   try {
-    const offer = await SS.pc.createOffer({
-      offerToReceiveAudio: false,
-      offerToReceiveVideo: false
-    });
-    await SS.pc.setLocalDescription(offer);
-
-    broadcast({
-      type: 'webrtc_offer',
-      payload: { sdp: SS.pc.localDescription }
-    });
-
-    sysMsg('Sent stream offer to viewer...');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    webRTCLog('offer sent',{sessionId});
+    broadcast({ type:'webrtc_offer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
   } catch(e) {
     toast('Screen share error: ' + e.message);
-    sysMsg('Stream offer failed: ' + e.message);
   }
 }
 
@@ -1612,34 +1645,104 @@ function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 /* ----------------------------------
    SCREEN SHARE (WebRTC via Ably signalling)
 ---------------------------------- */
-let SS={pc:null,stream:null,isSharing:false,role:null,signalPeerId:'',pendingRemoteCandidates:[],_retried:false};
+let SS={pc:null,stream:null,isSharing:false,role:null,signalPeerId:'',pendingRemoteCandidates:[],pendingIceBySession:{},sessionId:'',_retried:false};
 
-function resetPeerConnection(){
-  if(SS.pc){try{SS.pc.close()}catch(e){}}
+function webRTCLog(message,details){
+  if(details!==undefined)console.log('[ScreenDate WebRTC] '+message,details);
+  else console.log('[ScreenDate WebRTC] '+message);
+}
+function webRTCWarn(message,details){
+  if(details!==undefined)console.warn('[ScreenDate WebRTC] '+message,details);
+  else console.warn('[ScreenDate WebRTC] '+message);
+}
+function createWebRTCSessionId(){
+  return 'ss_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10);
+}
+function getWebRTCSessionId(data){
+  return (data&&(data.sessionId||(data.payload&&data.payload.sessionId)))||'';
+}
+function ensureRemoteIceQueue(sessionId){
+  const sid=sessionId||SS.sessionId||'pending';
+  if(!SS.pendingIceBySession)SS.pendingIceBySession={};
+  if(!SS.pendingIceBySession[sid])SS.pendingIceBySession[sid]=[];
+  return {sessionId:sid,queue:SS.pendingIceBySession[sid]};
+}
+function setActiveWebRTCSession(sessionId){
+  const sid=sessionId||createWebRTCSessionId();
+  const entry=ensureRemoteIceQueue(sid);
+  SS.sessionId=sid;
+  SS.pendingRemoteCandidates=entry.queue;
+  return sid;
+}
+function logPeerConnectionState(label,sessionId,pc){
+  if(!pc)return;
+  webRTCLog(label,{
+    sessionId,
+    connectionState:pc.connectionState,
+    iceConnectionState:pc.iceConnectionState,
+    iceGatheringState:pc.iceGatheringState
+  });
+}
+function attachPeerConnectionStateLogs(pc,label,sessionId){
+  pc.oniceconnectionstatechange=()=>logPeerConnectionState(label+' iceConnectionState',sessionId,pc);
+  pc.onicegatheringstatechange=()=>logPeerConnectionState(label+' iceGatheringState',sessionId,pc);
+}
+function resetPeerConnection(keepSessionId){
+  if(SS.pc){
+    logPeerConnectionState('pc closing',SS.sessionId,SS.pc);
+    try{SS.pc.close()}catch(e){}
+  }
   SS.pc=null;
-  SS.pendingRemoteCandidates=[];
   SS.signalPeerId='';
+  if(keepSessionId)setActiveWebRTCSession(keepSessionId);
+  else{
+    SS.sessionId='';
+    SS.pendingRemoteCandidates=[];
+  }
 }
-function queueRemoteIceCandidate(candidate){
+function queueRemoteIceCandidate(candidate,sessionId){
   if(!candidate)return;
-  if(!SS.pc){
-    // PC not ready yet - queue for later
-    if(!SS.pendingRemoteCandidates) SS.pendingRemoteCandidates=[];
-    SS.pendingRemoteCandidates.push(candidate);
+  const entry=ensureRemoteIceQueue(sessionId);
+  const sid=entry.sessionId;
+  const active=!!(SS.sessionId&&sid===SS.sessionId);
+  if(active)SS.pendingRemoteCandidates=entry.queue;
+  if(active&&SS.pc&&SS.pc.remoteDescription&&SS.pc.remoteDescription.type){
+    SS.pc.addIceCandidate(new RTCIceCandidate(candidate))
+      .then(()=>webRTCLog('ICE candidate applied',{sessionId:sid}))
+      .catch(e=>webRTCWarn('ICE candidate apply failed',{sessionId:sid,error:e.message}));
     return;
   }
-  if(SS.pc.remoteDescription&&SS.pc.remoteDescription.type){
-    SS.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(()=>{});
-    return;
-  }
-  SS.pendingRemoteCandidates.push(candidate);
+  entry.queue.push(candidate);
+  webRTCLog('ICE candidate queued',{
+    sessionId:sid,
+    active,
+    hasPeerConnection:!!SS.pc,
+    hasRemoteDescription:!!(SS.pc&&SS.pc.remoteDescription&&SS.pc.remoteDescription.type),
+    queued:entry.queue.length
+  });
 }
-async function flushRemoteIceCandidates(){
-  if(!SS.pc||!SS.pendingRemoteCandidates.length)return;
-  const pending=[...SS.pendingRemoteCandidates];
-  SS.pendingRemoteCandidates=[];
+async function flushRemoteIceCandidates(sessionId){
+  const sid=sessionId||SS.sessionId;
+  if(!sid||!SS.pc)return;
+  if(sid!==SS.sessionId){
+    webRTCLog('ICE flush skipped for inactive session',{sessionId:sid,activeSessionId:SS.sessionId});
+    return;
+  }
+  if(!SS.pc.remoteDescription||!SS.pc.remoteDescription.type){
+    webRTCLog('ICE flush waiting for remoteDescription',{sessionId:sid});
+    return;
+  }
+  const entry=ensureRemoteIceQueue(sid);
+  if(!entry.queue.length)return;
+  const pending=entry.queue.splice(0);
+  SS.pendingRemoteCandidates=entry.queue;
   for(const cand of pending){
-    try{await SS.pc.addIceCandidate(new RTCIceCandidate(cand))}catch(e){}
+    try{
+      await SS.pc.addIceCandidate(new RTCIceCandidate(cand));
+      webRTCLog('ICE candidate applied',{sessionId:sid});
+    }catch(e){
+      webRTCWarn('ICE candidate apply failed',{sessionId:sid,error:e.message});
+    }
   }
 }
 async function bindScreenVideo(stream,muted){
@@ -1712,10 +1815,6 @@ async function toggleShare(){
     document.getElementById('np-text').textContent='📡 '+S.myName+' is sharing screen';
     sysMsg('You started sharing your screen 🖥️');
     broadcast({type:'ss_start',name:S.myName});
-    // Send offer after a short delay to allow viewer to process ss_start first
-    setTimeout(() => {
-      if(SS.stream && SS.isSharing) startWebRTCOffer();
-    }, 1500);
 
     // Handle stream end (user clicks browser's stop button)
     stream.getVideoTracks()[0].addEventListener('ended',()=>stopShare());
@@ -1754,88 +1853,93 @@ function setSSStatus(text,color){
 }
 
 /* WebRTC core */
-const RTC_CONFIG={
-  iceServers:[
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun2.l.google.com:19302'},
-    {urls:'stun:stun3.l.google.com:19302'},
-    {urls:'stun:stun4.l.google.com:19302'},
-    {
-      urls:'stun:openrelay.metered.ca:80'
-    },
-    {
-      urls:'turn:openrelay.metered.ca:80',
-      username:'openrelayproject',
-      credential:'openrelayproject'
-    },
-    {
-      urls:'turn:openrelay.metered.ca:443',
-      username:'openrelayproject',
-      credential:'openrelayproject'
-    },
-    {
-      urls:'turn:openrelay.metered.ca:443?transport=tcp',
-      username:'openrelayproject',
-      credential:'openrelayproject'
-    }
-  ],
-  iceCandidatePoolSize: 4
-};
+const FORCE_TURN_RELAY = false;
+const GOOGLE_STUN_FALLBACK = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun2.l.google.com:19302',
+  'stun:stun3.l.google.com:19302'
+];
+const TURN_ICE_SERVERS = [
+  /*
+    Add real TURN credentials here from Metered, Twilio, Xirsys,
+    ExpressTURN, or your own coturn server.
 
-async function viewerJoin(autoRetry=false){
+    TODO: For production, prefer short-lived TURN credentials from a backend
+    token endpoint instead of hardcoding long-lived TURN secrets in this file.
+
+    Example:
+    {
+      urls: [
+        'turn:turn.example.com:3478?transport=udp',
+        'turn:turn.example.com:3478?transport=tcp',
+        'turns:turn.example.com:443?transport=tcp'
+      ],
+      username: 'REPLACE_WITH_TURN_USERNAME',
+      credential: 'REPLACE_WITH_TURN_PASSWORD'
+    }
+  */
+];
+function getRTCConfig(){
+  const turnServers=TURN_ICE_SERVERS.filter(server=>{
+    const urls=Array.isArray(server.urls)?server.urls:[server.urls];
+    return urls.filter(Boolean).length&&server.username&&server.credential;
+  });
+  const config={
+    iceServers:[
+      ...turnServers,
+      {urls:GOOGLE_STUN_FALLBACK}
+    ]
+  };
+  if(FORCE_TURN_RELAY)config.iceTransportPolicy='relay';
+  return config;
+}
+
+async function viewerJoin(autoRetry=false) {
   if(!NET.ready || !NET.channel) {
     toast('Connecting... try again in a moment.');
     return;
   }
   if(!autoRetry) CONN.streamRetries = 0;
   if(!autoRetry) SS._retried = false;
-
-  resetPeerConnection();
+  
+  let sessionId = createWebRTCSessionId();
+  resetPeerConnection(sessionId);
   SS.role = 'viewer';
   CONN.streamConnected = false;
-
-  // Show connecting UI
+  
   document.getElementById('vph').style.display = 'none';
   document.getElementById('remote-screen').style.display = 'flex';
   const remoteText = document.getElementById('remote-screen-text');
-  if(remoteText) remoteText.textContent =
-    autoRetry ? 'Reconnecting...' : 'Connecting to screen share...';
+  if(remoteText) remoteText.textContent = 
+    autoRetry ? 'Reconnecting...' : 'Connecting...';
   document.getElementById('ss-btn').style.display = 'none';
   setSSStatus('Connecting to host screen...', 'var(--violet)');
   document.getElementById('np').style.display = 'flex';
-  document.getElementById('np-text').textContent =
+  document.getElementById('np-text').textContent = 
     '👁 Watching ' + (S.partnerName||'host') + "'s screen";
-
-  broadcast({
-    type: 'watch_request',
-    name: S.myName
-  });
-
+  
+  webRTCLog('watch_request sent',{sessionId});
+  broadcast({ type: 'watch_request', name: S.myName, sessionId: sessionId, payload: { sessionId: sessionId } });
+  
   clearTimeout(NET.connectTimer);
   NET.connectTimer = setTimeout(() => {
     if(CONN.streamConnected) return;
     if(autoRetry) { scheduleStreamReconnect(); return; }
-
-    // Try one more time automatically
     if(!SS._retried) {
       SS._retried = true;
-      broadcast({ type: 'watch_request', name: S.myName });
+      sessionId = createWebRTCSessionId();
+      resetPeerConnection(sessionId);
+      SS.role = 'viewer';
+      webRTCLog('watch_request retry sent',{sessionId});
+      broadcast({ type: 'watch_request', name: S.myName, sessionId: sessionId, payload: { sessionId: sessionId } });
       NET.connectTimer = setTimeout(() => {
         if(CONN.streamConnected) return;
-        toast('Could not connect. Ask host to restart sharing.', 5500);
-        document.getElementById('ss-btn').style.display = 'flex';
-        document.getElementById('remote-screen').style.display = 'none';
-        document.getElementById('vph').style.display = 'flex';
-        setupRoleButtons();
+        failViewerStreamConnection('initial watch retry timed out');
       }, 10000);
       return;
     }
-
-    toast('Could not connect. Ask host to restart sharing.', 5500);
-    document.getElementById('ss-btn').style.display = 'flex';
-    document.getElementById('remote-screen').style.display = 'none';
-    document.getElementById('vph').style.display = 'flex';
-    setupRoleButtons();
+    failViewerStreamConnection('initial watch timed out');
   }, 15000);
 }
 
@@ -1852,12 +1956,6 @@ function incomingSsStart(name){
   watchBtn.disabled=false;
   watchBtn.classList.remove('disabled');
   watchBtn.style.display='flex';
-  // Auto-join as viewer — send watch_request so host sends us the offer
-  if(!S.isHost && NET.ready && NET.channel) {
-    setTimeout(() => {
-      viewerJoin();
-    }, 800);
-  }
 }
 
 function incomingSsStop(name){
@@ -1993,6 +2091,7 @@ function doLeave(){
   NET.connectingToHost=false;
   clearTimeout(NET.connectTimer);
   NET.connectTimer=null;
+  if(CONN.streamReconnectTimer){clearTimeout(CONN.streamReconnectTimer);CONN.streamReconnectTimer=null}
   if(NET.reconnectTimer){clearTimeout(NET.reconnectTimer);NET.reconnectTimer=null}
   if(NET.ably){
     try{NET.ably.close()}catch(e){}
@@ -2030,7 +2129,6 @@ function toast(msg,dur=2800){
 /* -- BOOT -- */
 showPage('landing');
 </script>
-<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
 
