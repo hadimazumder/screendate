@@ -1323,12 +1323,11 @@ function initAblyTransport(){
   const channelName = 'screendate-' + S.roomCode;
 
   const ably = new Ably.Realtime({
-    authUrl: '/api/ably-token',
-    authMethod: 'GET',
-    // Backend must issue a token scoped only to this room channel
-    // (for example: capability { [channelName]: ['publish','subscribe'] }).
-    authParams: { roomCode: S.roomCode, channel: channelName, clientId: CLIENT_ID },
-    clientId: CLIENT_ID
+  authUrl: '/api/ably-token',
+  authMethod: 'GET',
+  authParams: { roomCode: S.roomCode, channel: channelName, clientId: CLIENT_ID },
+  clientId: CLIENT_ID
+});
   });
 
   NET.ably = ably;
