@@ -1450,17 +1450,24 @@ async function handleWebRTCOffer(data) {
     webRTCLog('offer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
     return;
   }
-  resetPeerConnection(sessionId);
-  await ensureTurnCredentials();
-  SS.pc = new RTCPeerConnection(getRTCConfig());
-  SS.role = 'viewer';
-  setActiveWebRTCSession(sessionId);
-  const pc = SS.pc;
-  attachPeerConnectionStateLogs(pc,'viewer pc',sessionId);
-  logPeerConnectionState('viewer pc created',sessionId,pc);
-  SS.pc.onicecandidate = e => {
-    handleLocalIceCandidate(e,sessionId);
+ function getRTCConfig(){
+  return {
+    iceServers:[
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:stun1.l.google.com:19302'},
+      {
+        urls:'turn:freestun.net:3478',
+        username:'free',
+        credential:'free'
+      },
+      {
+        urls:'turns:freestun.net:5349',
+        username:'free',
+        credential:'free'
+      }
+    ]
   };
+}
   SS.pc.ontrack = async e => {
     const stream = e.streams && e.streams[0];
     if(!stream) return;
@@ -1547,7 +1554,9 @@ async function startWebRTCOffer(requestedSessionId) {
   SS.offerInProgress=true;
   SS.offeredSessionId=sessionId;
   resetPeerConnection(sessionId);
-  await ensureTurnCredentials();
+ async function ensureTurnCredentials(){
+  return [];
+};
   SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'offerer';
   setActiveWebRTCSession(sessionId);
