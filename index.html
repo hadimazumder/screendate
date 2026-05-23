@@ -890,6 +890,10 @@ const ROOM_CODE_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ0123456789';
 let NET = {
   ably: null,
   channel: null,
+  channelName: '',
+  channelSubscribed: false,
+  channelAttached: false,
+  channelAttaching: false,
   ready: false,
   dataConnected: false,
   connectingToHost: false,
@@ -1133,23 +1137,11 @@ function scheduleStreamReconnect(){
   },3000);
 }
 function schedulePeerReconnect(reason){
-  if(NET.reconnectTimer)return;
+  NET.ready=false;
+  NET.dataConnected=false;
+  CONN.dataConnected=false;
   setReconnectBanner(true);
-  NET.retries=(NET.retries||0)+1;
-  const delay=Math.min(8000,1000*NET.retries);
-  setConnBadge('warn','Reconnecting...');
-  NET.reconnectTimer=setTimeout(()=>{
-    NET.reconnectTimer=null;
-    if(NET.ably){
-      try{NET.ably.close()}catch(e){}
-    }
-    NET.ably=null;
-    NET.channel=null;
-    NET.ready=false;
-    NET.dataConnected=false;
-    CONN.dataConnected=false;
-    initAblyTransport();
-  },delay);
+  setConnBadge('warn','Reconnecting…');
 }
 /* -- PAGES -- */
 function showPage(p){
@@ -1280,8 +1272,8 @@ function setupRoleButtons(){
   }
   btn.textContent='👁 Watch';
   btn.onclick=viewerJoin;
-  btn.disabled=true;
-  btn.classList.add('disabled');
+  btn.disabled=false;
+  btn.classList.remove('disabled');
   setSSStatus('Waiting for host','var(--text3)');
 }
 function manualRetryConnection(){
@@ -1291,6 +1283,10 @@ function manualRetryConnection(){
   }
   NET.ably=null;
   NET.channel=null;
+  NET.channelName='';
+  NET.channelSubscribed=false;
+  NET.channelAttached=false;
+  NET.channelAttaching=false;
   NET.ready=false;
   NET.dataConnected=false;
   CONN.dataConnected=false;
@@ -1319,76 +1315,124 @@ function initAblyTransport(){
     return;
   }
   if(NET.ably) return;
-  setConnBadge('warn', 'Connecting...');
+  setReconnectBanner(true);
+  setConnBadge('warn', 'Connecting…');
   const channelName = 'screendate-' + S.roomCode;
+  NET.channelName = channelName;
 
   const ably = new Ably.Realtime({
-  key: 'Ga_1Rw.SGk7BQ:CHJeB7zDcZ6YCewowiSgnaCcvfc65PJWLWT3IWhVmcI',
-  clientId: CLIENT_ID
-});
-});
+    key: 'Ga_1Rw.SGk7BQ:CHJeB7zDcZ6YCewowiSgnaCcvfc65PJWLWT3IWhVmcI',
+    clientId: CLIENT_ID
   });
 
   NET.ably = ably;
 
-  ably.connection.on('connected', () => {
-    NET.ready = true;
-    NET.retries = 0;
-    setReconnectBanner(false);
-    setConnBadge('online', 'Connected');
-
-    NET.channel = ably.channels.get(channelName);
-
-    NET.channel.subscribe(msg => {
-      try {
-        const data = JSON.parse(msg.data);
-        handleAblyMessage(data);
-      } catch(e) {}
+  function attachRoomChannel(){
+    if(!NET.channel)NET.channel = ably.channels.get(channelName);
+    if(!NET.channelSubscribed){
+      NET.channel.subscribe(msg => {
+        try {
+          const data = JSON.parse(msg.data);
+          handleAblyMessage(data);
+        } catch(e) {}
+      });
+      NET.channelSubscribed=true;
+    }
+    if(NET.channelAttached&&NET.channel.state==='attached'){
+      NET.ready=true;
+      NET.dataConnected=true;
+      CONN.dataConnected=true;
+      NET.hasEverConnected=true;
+      setConnBadge('online','Connected');
+      flushQueuedMessagesAfterAttach();
+      return;
+    }
+    if(NET.channelAttaching)return;
+    NET.channelAttaching=true;
+    NET.channel.attach(err => {
+      NET.channelAttaching=false;
+      if(err){
+        console.error('[ABLY] channel attach failed',err);
+        NET.ready=false;
+        NET.dataConnected=false;
+        CONN.dataConnected=false;
+        NET.channelAttached=false;
+        setReconnectBanner(false);
+        setConnBadge('offline','Channel failed');
+        return;
+      }
+      NET.channelAttached=true;
+      NET.ready=true;
+      NET.dataConnected=true;
+      CONN.dataConnected=true;
+      NET.hasEverConnected=true;
+      setConnBadge('online','Connected');
+      flushQueuedMessagesAfterAttach();
     });
+  }
 
-    NET.channel.attach(() => {
-      NET.dataConnected = true;
-      CONN.dataConnected = true;
-      NET.hasEverConnected = true;
-      if(MSG_QUEUE.length > 0) {
-        const queued = [...MSG_QUEUE];
-        MSG_QUEUE = [];
-        queued.forEach(d => broadcast(d));
-      }
-      if(!S.isHost) {
-        setupRoleButtons();
-        setTimeout(() => {
-          broadcast({type:'join', name:S.myName});
-        }, 500);
-      }
-      if(S.isHost) {
+  function flushQueuedMessagesAfterAttach(){
+    if(MSG_QUEUE.length > 0) {
+      const queued = [...MSG_QUEUE];
+      MSG_QUEUE = [];
+      queued.forEach(d => broadcast(d));
+    }
+    if(!S.isHost) {
+      setupRoleButtons();
+      setTimeout(() => {
         broadcast({type:'join', name:S.myName});
-        startHostPresenceAnnouncements();
-      }
-    });
+      }, 500);
+    }
+    if(S.isHost) {
+      broadcast({type:'join', name:S.myName});
+      startHostPresenceAnnouncements();
+    }
+  }
+
+  ably.connection.on(stateChange => {
+    console.log('[ABLY]', stateChange.previous, '->', stateChange.current, stateChange.reason);
+    if(stateChange.current==='connecting'){
+      NET.ready=false;
+      NET.dataConnected=false;
+      CONN.dataConnected=false;
+      setReconnectBanner(true);
+      setConnBadge('warn','Connecting…');
+      return;
+    }
+    if(stateChange.current==='connected'){
+      NET.retries=0;
+      setReconnectBanner(false);
+      attachRoomChannel();
+      return;
+    }
+    if(stateChange.current==='disconnected'||stateChange.current==='suspended'){
+      NET.ready=false;
+      NET.dataConnected=false;
+      CONN.dataConnected=false;
+      NET.channelAttached=false;
+      setReconnectBanner(true);
+      setConnBadge('warn','Reconnecting…');
+      return;
+    }
+    if(stateChange.current==='failed'){
+      NET.ready=false;
+      NET.dataConnected=false;
+      CONN.dataConnected=false;
+      NET.channelAttached=false;
+      setReconnectBanner(false);
+      setConnBadge('offline','Connection failed — check Ably key/network');
+      return;
+    }
+    if(stateChange.current==='closed'){
+      NET.ready=false;
+      NET.dataConnected=false;
+      CONN.dataConnected=false;
+      NET.channelAttached=false;
+      setReconnectBanner(false);
+      setConnBadge('offline','Closed');
+    }
   });
 
-  ably.connection.on('disconnected', () => {
-    NET.ready = false;
-    NET.dataConnected = false;
-    CONN.dataConnected = false;
-    setConnBadge('warn', 'Disconnected');
-    schedulePeerReconnect('disconnected');
-  });
-
-  ably.connection.on('failed', () => {
-    NET.ready = false;
-    NET.dataConnected = false;
-    CONN.dataConnected = false;
-    setConnBadge('offline', 'Connection failed');
-  });
-
-  ably.connection.on('closed', () => {
-    NET.ready = false;
-    NET.dataConnected = false;
-    CONN.dataConnected = false;
-    setConnBadge('offline', 'Closed');
-  });
 }
 function handleAblyMessage(data) {
   if(!data) return;
@@ -1424,9 +1468,9 @@ function handleAblyMessage(data) {
   }
   if(data.type === 'watch_request') {
     if(!S.isHost) return;
-    const sessionId = getWebRTCSessionId(data);
+    const sessionId = getWebRTCSessionId(data) 
+      || createWebRTCSessionId();
     webRTCLog('watch_request received',{sessionId,fromId:data.fromId,fromName:data.fromName||data.from});
-    if(!sessionId)return;
     NET.pendingViewers.add(data.fromId || data.fromName || data.from || 'viewer');
     if(SS.stream && SS.isSharing) {
       if((SS.offerInProgress||SS.offeredSessionId===sessionId)&&SS.sessionId===sessionId){
@@ -1446,28 +1490,24 @@ async function handleWebRTCOffer(data) {
   if(!sdp) return;
   const sessionId = getWebRTCSessionId(data)||createWebRTCSessionId();
   webRTCLog('offer received',{sessionId});
-  if(!isActiveWebRTCSession(sessionId)){
-    webRTCLog('offer ignored for inactive session',{sessionId,activeSessionId:SS.sessionId});
-    return;
+  if(sessionId) {
+    resetPeerConnection(sessionId);
+    setActiveWebRTCSession(sessionId);
+  } else {
+    const newId = createWebRTCSessionId();
+    resetPeerConnection(newId);
+    setActiveWebRTCSession(newId);
   }
- function getRTCConfig(){
-  return {
-    iceServers:[
-      {urls:'stun:stun.l.google.com:19302'},
-      {urls:'stun:stun1.l.google.com:19302'},
-      {
-        urls:'turn:freestun.net:3478',
-        username:'free',
-        credential:'free'
-      },
-      {
-        urls:'turns:freestun.net:5349',
-        username:'free',
-        credential:'free'
-      }
-    ]
+  await ensureTurnCredentials();
+  SS.pc = new RTCPeerConnection(getRTCConfig());
+  SS.role = 'viewer';
+  setActiveWebRTCSession(sessionId);
+  const pc = SS.pc;
+  attachPeerConnectionStateLogs(pc,'viewer pc',sessionId);
+  logPeerConnectionState('viewer pc created',sessionId,pc);
+  SS.pc.onicecandidate = e => {
+    handleLocalIceCandidate(e,sessionId);
   };
-}
   SS.pc.ontrack = async e => {
     const stream = e.streams && e.streams[0];
     if(!stream) return;
@@ -1515,12 +1555,14 @@ async function handleWebRTCOffer(data) {
   };
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    sysMsg('📥 Received offer, sending answer...');
     await flushRemoteIceCandidates(sessionId);
     const answer = await pc.createAnswer();
     webRTCLog('answer created',{sessionId});
     await pc.setLocalDescription(answer);
     webRTCLog('answer sent',{sessionId});
     broadcast({ type:'webrtc_answer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
+    sysMsg('📤 Answer sent to host...');
   } catch(e) {
     toast('Connection error: ' + e.message);
   }
@@ -1540,6 +1582,7 @@ async function handleWebRTCAnswer(data) {
       await SS.pc.setRemoteDescription(
         new RTCSessionDescription(sdp)
       );
+      sysMsg('✅ Answer received by host...');
       await flushRemoteIceCandidates(sessionId||SS.sessionId);
     }
   } catch(e) {}
@@ -1554,9 +1597,7 @@ async function startWebRTCOffer(requestedSessionId) {
   SS.offerInProgress=true;
   SS.offeredSessionId=sessionId;
   resetPeerConnection(sessionId);
- async function ensureTurnCredentials(){
-  return [];
-};
+  await ensureTurnCredentials();
   SS.pc = new RTCPeerConnection(getRTCConfig());
   SS.role = 'offerer';
   setActiveWebRTCSession(sessionId);
@@ -1587,6 +1628,7 @@ async function startWebRTCOffer(requestedSessionId) {
     await pc.setLocalDescription(offer);
     webRTCLog('offer sent',{sessionId});
     broadcast({ type:'webrtc_offer', sessionId: sessionId, payload:{ sessionId: sessionId, sdp: pc.localDescription }});
+    sysMsg('📡 Offer sent to viewer...');
   } catch(e) {
     toast('Screen share error: ' + e.message);
   } finally {
@@ -1632,7 +1674,7 @@ function initRoom(){
 
 /* -- SYNC -- */
 function broadcast(d){
-  if(!NET.channel) {
+  if(!NET.ready || !NET.channel) {
     MSG_QUEUE.push(d);
     return;
   }
@@ -2053,33 +2095,28 @@ function normalizeTurnIceServers(data){
     credential:server.credential||server.password||server.token||''
   })).filter(server=>server.urls.length&&server.username&&server.credential);
 }
-async function ensureTurnCredentials(){
-  if(TURN_ICE_SERVERS.length)return TURN_ICE_SERVERS;
-  if(!TURN_CREDENTIALS_PROMISE){
-    TURN_CREDENTIALS_PROMISE=fetch(TURN_CREDENTIALS_URL,{cache:'no-store'})
-      .then(r=>r.ok?r.json():Promise.reject(new Error('TURN credentials HTTP '+r.status)))
-      .then(data=>{
-        TURN_ICE_SERVERS=normalizeTurnIceServers(data);
-        console.log('[SD-RTC] TURN credentials loaded',{count:TURN_ICE_SERVERS.length});
-        return TURN_ICE_SERVERS;
-      })
-      .catch(e=>{
-        console.warn('[SD-RTC] TURN credentials unavailable',e.message);
-        TURN_ICE_SERVERS=[];
-        return TURN_ICE_SERVERS;
-      });
-  }
-  return TURN_CREDENTIALS_PROMISE;
+async function ensureTurnCredentials() {
+  return Promise.resolve([]);
 }
-function getRTCConfig(){
-  const config={
-    iceServers:[
-      ...TURN_ICE_SERVERS,
-      {urls:GOOGLE_STUN_FALLBACK}
+function getRTCConfig() {
+  return {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      {
+        urls: 'turn:freestun.net:3478',
+        username: 'free',
+        credential: 'free'
+      },
+      {
+        urls: 'turns:freestun.net:5349',
+        username: 'free',
+        credential: 'free'
+      }
     ]
   };
-  if(FORCE_TURN_RELAY)config.iceTransportPolicy='relay';
-  return config;
 }
 console.log('[SD-RTC] RTC config loaded', getRTCConfig());
 
@@ -2174,8 +2211,8 @@ function incomingSsStop(name){
   }else{
     shareBtn.textContent='👁 Watch';
     shareBtn.onclick=viewerJoin;
-    shareBtn.disabled=true;
-    shareBtn.classList.add('disabled');
+    shareBtn.disabled=false;
+    shareBtn.classList.remove('disabled');
     setSSStatus('Waiting for host','var(--text3)');
   }
   toast(displayName+' stopped sharing 🛑');
@@ -2317,6 +2354,10 @@ function doLeave(){
   NET = {
     ably: null,
     channel: null,
+    channelName: '',
+    channelSubscribed: false,
+    channelAttached: false,
+    channelAttaching: false,
     ready: false,
     dataConnected: false,
     connectingToHost: false,
