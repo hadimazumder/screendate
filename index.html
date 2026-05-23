@@ -1323,10 +1323,9 @@ function initAblyTransport(){
   const channelName = 'screendate-' + S.roomCode;
 
   const ably = new Ably.Realtime({
-  authUrl: '/api/ably-token',
-  authMethod: 'GET',
-  authParams: { roomCode: S.roomCode, channel: channelName, clientId: CLIENT_ID },
+  key: 'Ga_1Rw.SGk7BQ:CHJeB7zDcZ6YCewowiSgnaCcvfc65PJWLWT3IWhVmcI',
   clientId: CLIENT_ID
+});
 });
   });
 
