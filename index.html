@@ -2096,27 +2096,40 @@ function normalizeTurnIceServers(data){
   })).filter(server=>server.urls.length&&server.username&&server.credential);
 }
 async function ensureTurnCredentials() {
-  return Promise.resolve([]);
+  if (TURN_ICE_SERVERS.length > 0) return TURN_ICE_SERVERS;
+  if (TURN_CREDENTIALS_PROMISE) return TURN_CREDENTIALS_PROMISE;
+
+  TURN_CREDENTIALS_PROMISE = (async () => {
+    try {
+      if (!NET.ably) return [];
+      const response = await NET.ably.request('POST', '/iceServers', 2, null, null);
+      if (response && response.items) {
+        TURN_ICE_SERVERS = normalizeTurnIceServers(response.items);
+        webRTCLog('TURN credentials fetched from Ably', { count: TURN_ICE_SERVERS.length });
+      }
+      return TURN_ICE_SERVERS;
+    } catch (e) {
+      webRTCWarn('Failed to fetch TURN credentials from Ably', e);
+      return [];
+    } finally {
+      TURN_CREDENTIALS_PROMISE = null;
+    }
+  })();
+
+  return TURN_CREDENTIALS_PROMISE;
 }
 function getRTCConfig() {
-  return {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      {
-        urls: 'turn:freestun.net:3478',
-        username: 'free',
-        credential: 'free'
-      },
-      {
-        urls: 'turns:freestun.net:5349',
-        username: 'free',
-        credential: 'free'
-      }
-    ]
-  };
+  const iceServers = GOOGLE_STUN_FALLBACK.map(url => ({ urls: url }));
+  if (TURN_ICE_SERVERS && TURN_ICE_SERVERS.length > 0) {
+    iceServers.push(...TURN_ICE_SERVERS);
+  } else {
+    // Fallback if Ably TURN not yet loaded
+    iceServers.push(
+      { urls: 'turn:freestun.net:3478', username: 'free', credential: 'free' },
+      { urls: 'turns:freestun.net:5349', username: 'free', credential: 'free' }
+    );
+  }
+  return { iceServers };
 }
 console.log('[SD-RTC] RTC config loaded', getRTCConfig());
 
